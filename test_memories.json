@@ -1,0 +1,85 @@
+[
+    {
+        "userId": "test-user-123",
+        "title": "First Day of School",
+        "description": "My mom walked me to kindergarten class",
+        "date": {
+            "timestamp": "1995-09-01T08:00:00Z",
+            "approximateDate": "Fall 1995",
+            "timePeriod": "Childhood"
+        },
+        "location": {
+            "name": "Springfield Elementary School"
+        },
+        "people": [
+            {
+                "name": "Mom",
+                "relationship": "mother"
+            },
+            {
+                "name": "Mrs. Thompson",
+                "relationship": "teacher"
+            }
+        ],
+        "tags": ["school", "childhood", "milestone"],
+        "context": {
+            "emotions": ["nervous", "excited"],
+            "significance": 5,
+            "themes": ["education", "independence"]
+        }
+    },
+    {
+        "userId": "test-user-123",
+        "title": "High School Graduation",
+        "description": "Celebrated with family at local restaurant",
+        "date": {
+            "timestamp": "2013-06-15T18:30:00Z",
+            "approximateDate": "June 2013",
+            "timePeriod": "Adolescence"
+        },
+        "location": {
+            "name": "Main Street Diner"
+        },
+        "people": [
+            {
+                "name": "Dad",
+                "relationship": "father"
+            },
+            {
+                "name": "Sarah",
+                "relationship": "sister"
+            }
+        ],
+        "tags": ["education", "family", "achievement"],
+        "context": {
+            "emotions": ["proud", "hopeful"],
+            "significance": 8,
+            "themes": ["accomplishment", "transition"]
+        }
+    },
+    {
+        "userId": "test-user-123",
+        "title": "First Job Interview",
+        "description": "Nervous but prepared for my first professional interview",
+        "date": {
+            "timestamp": "2018-03-10T14:00:00Z",
+            "approximateDate": "Spring 2018",
+            "timePeriod": "EarlyAdulthood"
+        },
+        "location": {
+            "name": "Tech Startup Office"
+        },
+        "people": [
+            {
+                "name": "Mr. Johnson",
+                "relationship": "interviewer"
+            }
+        ],
+        "tags": ["career", "growth", "professional"],
+        "context": {
+            "emotions": ["anxious", "determined"],
+            "significance": 7,
+            "themes": ["career development", "self-improvement"]
+        }
+    }
+] 

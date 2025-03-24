@@ -1,0 +1,72 @@
+:root {
+    --header-height: 64px;
+    /* Earthy Color Palette */
+    --primary-color: #7E6B8F;  /* Muted Purple */
+    --secondary-color: #87A878; /* Sage Green */
+    --accent-color: #D4A373;   /* Warm Sand */
+    --background-color: #FAF9F6; /* Off White */
+    --text-color: #4A4A4A;     /* Soft Black */
+    
+    /* Shadows */
+    --card-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    
+    /* Rounded Corners */
+    --border-radius: 12px;
+}
+
+body {
+    font-family: 'Lora', serif;
+    background-color: var(--background-color);
+    color: var(--text-color);
+    line-height: 1.6;
+    overflow-x: hidden;
+}
+
+.app {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.main-content {
+    flex: 1;
+}
+
+/* Update auth container to account for header */
+.auth-container {
+    min-height: calc(100vh - var(--header-height));
+}
+
+/* Mobile Typography */
+@media (max-width: 768px) {
+    html {
+        font-size: 14px;
+    }
+
+    h1 { font-size: 1.8rem; }
+    h2 { font-size: 1.5rem; }
+    h3 { font-size: 1.2rem; }
+}
+
+/* Touch-friendly buttons */
+button {
+    min-height: 44px; /* iOS minimum touch target size */
+    min-width: 44px;
+}
+
+/* Prevent horizontal scroll */
+body {
+    overflow-x: hidden;
+}
+
+/* Better tap targets */
+a, button {
+    padding: 0.5rem;
+    margin: 0.25rem;
+}
+
+/* Responsive images */
+img {
+    max-width: 100%;
+    height: auto;
+} 

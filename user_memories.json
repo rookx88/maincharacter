@@ -1,0 +1,91 @@
+[
+    {
+        "system": {
+            "userId": "679700df862265deacddee55"
+        },
+        "title": "Childhood Summer Vacation",
+        "description": "Spent summers at grandma's house by the lake",
+        "date": {
+            "timestamp": "2005-07-15T00:00:00Z",
+            "approximateDate": "Summer 2005",
+            "timePeriod": "Childhood"
+        },
+        "location": {
+            "name": "Grandma's Lake House"
+        },
+        "people": [
+            {
+                "name": "Grandma",
+                "relationship": "grandmother"
+            },
+            {
+                "name": "Cousin Mike",
+                "relationship": "cousin"
+            }
+        ],
+        "tags": ["family", "summer", "childhood"],
+        "context": {
+            "emotions": ["happy", "carefree"],
+            "significance": 5,
+            "themes": ["family bonds", "nature"]
+        }
+    },
+    {
+        "system": {
+            "userId": "679700df862265deacddee55"
+        },
+        "title": "College Graduation Day",
+        "description": "Celebrated my computer science degree with friends",
+        "date": {
+            "timestamp": "2020-05-20T10:00:00Z",
+            "approximateDate": "May 2020",
+            "timePeriod": "EarlyAdulthood"
+        },
+        "location": {
+            "name": "University of Tech Campus"
+        },
+        "people": [
+            {
+                "name": "Alex",
+                "relationship": "roommate"
+            },
+            {
+                "name": "Dr. Smith",
+                "relationship": "advisor"
+            }
+        ],
+        "tags": ["education", "achievement", "friendship"],
+        "context": {
+            "emotions": ["proud", "nostalgic"],
+            "significance": 5,
+            "themes": ["academic success", "transition"]
+        }
+    },
+    {
+        "system": {
+            "userId": "679700df862265deacddee55"
+        },
+        "title": "First Code Deployment",
+        "description": "Shipped my first production feature at work",
+        "date": {
+            "timestamp": "2022-03-15T15:30:00Z",
+            "approximateDate": "Spring 2022",
+            "timePeriod": "MiddleAdulthood"
+        },
+        "location": {
+            "name": "Tech Startup Office"
+        },
+        "people": [
+            {
+                "name": "Sarah",
+                "relationship": "team lead"
+            }
+        ],
+        "tags": ["career", "technology", "milestone"],
+        "context": {
+            "emotions": ["accomplished", "nervous"],
+            "significance": 5,
+            "themes": ["professional growth", "responsibility"]
+        }
+    }
+] 
