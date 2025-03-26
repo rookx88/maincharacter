@@ -301,4 +301,73 @@
     color: #e2e8f0;
     font-style: italic;
     text-shadow: 1px 1px 3px rgba(0, 0, 0, 0.9);
+}
+
+.chat-controls {
+    display: flex;
+    justify-content: center;
+    padding: 0.5rem;
+    background: rgba(0, 0, 0, 0.1);
+}
+
+.reset-button {
+    background-color: #ff4757;
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+    transition: background-color 0.2s;
+}
+
+.reset-button:hover {
+    background-color: #ff6b81;
+}
+
+.reset-button:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+}
+
+.end-modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.end-modal-content {
+    background-color: white;
+    padding: 2rem;
+    border-radius: 8px;
+    max-width: 500px;
+    text-align: center;
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+}
+
+.end-modal-content h2 {
+    margin-top: 0;
+    color: #333;
+}
+
+.end-modal-content button {
+    background-color: #4a90e2;
+    color: white;
+    border: none;
+    padding: 0.75rem 1.5rem;
+    border-radius: 4px;
+    font-size: 1rem;
+    cursor: pointer;
+    margin-top: 1.5rem;
+}
+
+.end-modal-content button:hover {
+    background-color: #3a80d2;
 } 

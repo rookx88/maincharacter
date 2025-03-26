@@ -51,10 +51,7 @@ app.get('/api/test', (req, res) => {
 const clientPath = path.join(__dirname, '../dist/client');
 app.use(express.static(clientPath));
 app.get('*', (req, res) => {
-    // Serve index.html for all routes except /api
-    if (!req.path.startsWith('/api')) {
-        res.sendFile(path.join(__dirname, 'client/index.html'));
-    }
+    res.sendFile(path.join(__dirname, '../dist/client/index.html'));
 });
 
 // Add after routes are mounted

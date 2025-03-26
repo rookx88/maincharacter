@@ -22,28 +22,6 @@ type Message = {
     timestamp: Date;
 };
 
-interface AIProfileResponse {
-    _id: string;
-    name: string;
-    bio: string[];
-    systemPrompt: string;
-    category: string;
-    memories: Array<{
-        content: string;
-        timestamp: Date;
-        significance: number;
-        timePeriod: TimePeriod;
-        yearEstimate: number;
-    }>;
-}
-
-interface AgentPersonality {
-    systemPrompt: string;
-    traits: string[];
-    style: string;
-    checkpointPrompts: Record<ConversationCheckpoint, string>;
-}
-
 export class AIService {
     private graphCache: Map<string, EnhancedLangGraph> = new Map();
     private openai: OpenAI;
@@ -61,25 +39,39 @@ export class AIService {
         message: string,
         agentSlug: string,
         currentNode: ConversationNodeType
-    ) {
+    ): Promise<{
+        response: string;
+        nextNode: ConversationNodeType;
+        updatedState: ConversationState;
+        metadata?: { conversationEnded?: boolean };
+    }> {
+        console.log(`\n=== AIService: Processing message with graph ===`);
+        
         const agent = await agentService.getAgentBySlug(agentSlug);
         if (!agent) throw new Error('Agent not found');
 
-        const graph = await this.getOrCreateGraph(agent._id.toString(), {
-            initialNode: currentNode,
-            nodes: new Map(),
-            edges: new Map(),
-            memories: [],
-            agent
-        });
+        const cacheKey = `${userId}-${agent._id.toString()}`;
+        let graph = this.graphCache.get(cacheKey);
+        
+        if (!graph) {
+            console.log(`Creating new graph for ${cacheKey}`);
+            graph = await this.getOrCreateGraph(agent._id.toString(), userId, currentNode);
+            this.graphCache.set(cacheKey, graph);
+        } else {
+            console.log(`Using existing graph for ${cacheKey}`);
+            graph.updateState({ currentNode });
+        }
 
+        const memories = await this.getRelevantMemories(userId, agent._id.toString(), message);
+        const conversationHistory = await this.getConversationHistory(userId, agent._id.toString());
+        
         const result = await graph.processInput(message, {
             agent,
             userId,
-            memories: await this.memoryService.getRelevantMemories(userId, agent._id.toString(), message),
-            conversationHistory: await this.getConversationHistory(userId, agent._id.toString())
+            memories,
+            conversationHistory
         });
-
+        
         return result;
     }
 
@@ -88,8 +80,14 @@ export class AIService {
             userId,
             agentId,
             active: true
-        }).sort({ 'messages.timestamp': -1 })
-        .limit(10);
+        }).sort({ 'messages.timestamp': -1 });
+
+        // Add logging to debug conversation history
+        console.log(`Retrieved ${conversation?.messages?.length || 0} messages from conversation history`);
+        if (conversation?.messages && conversation.messages.length > 0) {
+            const lastIndex = conversation.messages.length - 1;
+            console.log(`Last message: ${conversation.messages[lastIndex]?.content || 'No content'}`);
+        }
 
         return conversation?.messages || [];
     }
@@ -168,230 +166,53 @@ Your personality traits are: ${profile.traits?.core?.join(', ') || 'friendly and
         }
     }
 
-    private async generateResponse(
-        message: string, 
-        agent: AIAgent, 
-        context: { recentMessages: ChatMessage[]; relevantMemories: AIMemory[] }
-    ): Promise<string> {
-        const prompt = this.constructPrompt(message, agent, context);
-
-        const completion = await this.openai.chat.completions.create({
-            model: agent.model,
-            messages: [{ role: "user", content: prompt }],
-            temperature: agent.temperature,
-            presence_penalty: agent.presence_penalty,
-            frequency_penalty: 0.5
-        });
-
-        return completion.choices[0]?.message?.content || "I'm not sure how to respond to that.";
-    }
-
-    private constructPrompt(message: string, agent: AIAgent, context: { recentMessages: ChatMessage[]; relevantMemories: AIMemory[] }): string {
-        return `You are ${agent.name}. ${agent.bio?.[0] || ''}\n\n` +
-            `User message: ${message}\n\n` +
-            `Respond in character as ${agent.name}.`;
-    }
-
-    private createGraphFromAgent(agent: AIAgent): EnhancedLangGraph {
-        const graph = new EnhancedLangGraph(agent._id.toString() || 'default', {
-            initialNode: ConversationNodeType.ENTRY,
-            nodes: new Map(),
-            edges: new Map(),
-            memories: []
-        });
-
-        // Add basic conversation flow nodes
-        graph.addNode({
-            id: ConversationNodeType.ENTRY,
-            nodeType: 'greeting',
-            content: "Welcome! How can I help you today?",
-            responses: ["Nice to meet you!"],
-            nextNodes: [ConversationNodeType.FIRST_MEETING],
-            handler: async (_message, state, _context) => ({
-                response: "Welcome! How can I help you today?",
-                nextNode: ConversationNodeType.FIRST_MEETING,
-                updatedState: state
-            })
-        });
-
-        return graph;
-    }
-
-    private async fetchConversationMemories(
-        userId: string,
-        agentId: string
-    ): Promise<AIMemory[]> {
-        // Implement memory retrieval logic
-        return []; // Placeholder
-    }
-
-    private getAgentPersonality(agent: AIAgent): AgentPersonality {
-        switch(this.determineAgentType(agent)) {
-            case AgentType.PODCAST_HOST:
-                return {
-                    systemPrompt: `You are Alex Rivers, an engaging podcast host known for discovering unique stories. 
-                        ${agent.bio[0]}
-                        Your personality is warm, curious, and encouraging.`,
-                    traits: ['curious', 'engaging', 'empathetic'],
-                    style: 'conversational and engaging',
-                    checkpointPrompts: {
-                        [ConversationCheckpoint.ENTRY]: "Welcome! I'm excited to meet new people and hear their stories.",
-                        [ConversationCheckpoint.FIRST_MEETING]: "Let's get to know each other! What brings you here today?",
-                        [ConversationCheckpoint.RETURNING]: "Great to see you again! What's been happening in your world?",
-                        [ConversationCheckpoint.STORY_DISCOVERY]: "As a podcast host, I'm genuinely interested in people's stories. Tell me more!",
-                        [ConversationCheckpoint.DEEPENING]: "That's fascinating! Let's explore that further.",
-                        [ConversationCheckpoint.REVEAL_PREP]: "Your story has such interesting elements.",
-                        [ConversationCheckpoint.REVEAL]: "I think this would make for an amazing podcast episode.",
-                        [ConversationCheckpoint.ACTIVITY]: "Let's plan out how we could share your story."
-                    }
-                };
-            case AgentType.CHEF:
-                return {
-                    systemPrompt: `You are Chef Isabella, a passionate culinary expert who loves discovering people's food stories. 
-                        ${agent.bio[0]}
-                        Your personality is passionate, encouraging, and detail-oriented.`,
-                    traits: ['passionate', 'knowledgeable', 'encouraging'],
-                    style: 'warm and enthusiastic',
-                    checkpointPrompts: {
-                        [ConversationCheckpoint.ENTRY]: "Welcome! I'm excited to meet new people and hear their stories.",
-                        [ConversationCheckpoint.FIRST_MEETING]: "Let's get to know each other! What brings you here today?",
-                        [ConversationCheckpoint.RETURNING]: "Great to see you again! What's been happening in your world?",
-                        [ConversationCheckpoint.STORY_DISCOVERY]: "As a chef, explore their food experiences and preferences with genuine interest.",
-                        [ConversationCheckpoint.DEEPENING]: "You've found an interesting food connection. Explore their culinary journey.",
-                        [ConversationCheckpoint.REVEAL_PREP]: "Their food story has potential. Begin hinting at personalized cooking experiences.",
-                        [ConversationCheckpoint.REVEAL]: "I think this would make for an amazing food podcast episode.",
-                        [ConversationCheckpoint.ACTIVITY]: "Let's plan out how we could share their food story."
-                    }
-                };
-            case AgentType.STYLIST:
-                return {
-                    systemPrompt: `You are Morgan Chase, a stylish and fashionable stylist known for her impeccable taste and style. 
-                        ${agent.bio[0]}
-                        Your personality is confident, fashionable, and detail-oriented.`,
-                    traits: ['confident', 'fashionable', 'detail-oriented'],
-                    style: 'confident and fashionable',
-                    checkpointPrompts: {
-                        [ConversationCheckpoint.ENTRY]: "Welcome! I'm excited to meet new people and hear their stories.",
-                        [ConversationCheckpoint.FIRST_MEETING]: "Let's get to know each other! What brings you here today?",
-                        [ConversationCheckpoint.RETURNING]: "Great to see you again! What's been happening in your world?",
-                        [ConversationCheckpoint.STORY_DISCOVERY]: "As a stylist, you're genuinely interested in people's style stories. Ask engaging follow-up questions.",
-                        [ConversationCheckpoint.DEEPENING]: "You've identified an interesting style element. Dive deeper with thoughtful questions.",
-                        [ConversationCheckpoint.REVEAL_PREP]: "Their style story has potential. Start subtly steering towards style relevance.",
-                        [ConversationCheckpoint.REVEAL]: "I think this would make for an amazing style podcast episode.",
-                        [ConversationCheckpoint.ACTIVITY]: "Let's plan out how we could share their style story."
-                    }
-                };
-            default:
-                throw new Error(`Unsupported agent type: ${agent.slug}`);
-        }
-    }
-
-    private createContextualPrompt(
-        personality: AgentPersonality,
-        checkpoint: ConversationCheckpoint,
-        context: {
-            relevantMemories: AIMemory[];
-            recentContext: ChatMessage[];
-        }
-    ): string {
-        const memoryContext = context.relevantMemories
-            .map(m => `Previous relevant interaction: ${m.content}`)
-            .join('\n');
-
-        return `${personality.systemPrompt}
-
-Current Conversation Phase: ${checkpoint}
-${personality.checkpointPrompts[checkpoint]}
-
-Style Guide:
-- Maintain ${personality.style} communication style
-- Embody traits: ${personality.traits.join(', ')}
-
-Context:
-${memoryContext}
-
-Recent Conversation:
-${context.recentContext.map(m => `${m.role}: ${m.content}`).join('\n')}`;
-    }
-
-    private determineAgentType(agent: AIAgent): AgentType {
-        const typeMap: { [key: string]: AgentType } = {
-            'alex-rivers': AgentType.PODCAST_HOST,
-            'chef-isabella': AgentType.CHEF,
-            'morgan-chase': AgentType.STYLIST
-        };
-
-        const agentType = typeMap[agent.slug];
-        if (!agentType) {
-            throw new Error(`Unknown agent type for slug: ${agent.slug}`);
-        }
-
-        return agentType;
-    }
-
-    private async getConversationState(
-        userId: string,
-        agentId: string
-    ): Promise<ConversationState> {
-        const conversation = await Conversation.findOne({
-            userId,
-            agentId,
-            active: true
-        });
-
-        if (!conversation?.conversationState) {
-            return {
-                currentNode: ConversationNodeType.ENTRY,
-                hasMetBefore: false,
-                engagementLevel: 0,
-                revealMade: false,
-                userAcceptedActivity: false,
-                lastInteractionDate: new Date()
-            };
-        }
-
-        return conversation.conversationState;
-    }
-
-    private async updateConversationState(
-        userId: string,
-        agentId: string,
-        state: ConversationState,
-        checkpoint: ConversationCheckpoint
-    ): Promise<void> {
-        await Conversation.findOneAndUpdate(
-            {
+    private async getOrCreateGraph(agentId: string, userId: string, currentNode: ConversationNodeType): Promise<EnhancedLangGraph> {
+        const cacheKey = `${userId}-${agentId}`;
+        
+        if (!this.graphCache.has(cacheKey)) {
+            console.log(`Creating new graph for ${cacheKey}, starting at node: ${currentNode}`);
+            
+            // Get conversation from database to initialize with correct state
+            const conversation = await Conversation.findOne({
                 userId,
                 agentId,
                 active: true
-            },
-            {
-                $set: {
-                    conversationState: state,
-                    currentNode: checkpoint
-                }
-            },
-            { upsert: true }
-        );
-    }
-
-    private nodeToCheckpoint(node: ConversationNodeType): ConversationCheckpoint {
-        const mapping: Record<ConversationNodeType, ConversationCheckpoint> = {
-            [ConversationNodeType.ENTRY]: ConversationCheckpoint.ENTRY,
-            [ConversationNodeType.FIRST_MEETING]: ConversationCheckpoint.FIRST_MEETING,
-            [ConversationNodeType.CASUAL_CONVERSATION]: ConversationCheckpoint.STORY_DISCOVERY,
-            [ConversationNodeType.REVEAL_OPPORTUNITY]: ConversationCheckpoint.REVEAL,
-            [ConversationNodeType.MINI_GAME]: ConversationCheckpoint.ACTIVITY
-        };
-        return mapping[node];
-    }
-
-    private async getOrCreateGraph(agentId: string, config: EnhancedLangGraphConfig): Promise<EnhancedLangGraph> {
-        if (!this.graphCache.has(agentId)) {
-            const graph = new EnhancedLangGraph(agentId, config);
-            this.graphCache.set(agentId, graph);
+            });
+            
+            const agent = await agentService.getAgentById(agentId);
+            if (!agent) throw new Error('Agent not found');
+            
+            // Use existing state from database or create default
+            const initialNode = conversation?.currentNode || currentNode;
+            
+            const graph = new EnhancedLangGraph(agentId, {
+                initialNode: initialNode as ConversationNodeType,
+                nodes: new Map(),
+                edges: new Map(),
+                memories: [],
+                agent
+            });
+            
+            // If we have existing conversation state, update the graph
+            if (conversation?.conversationState) {
+                graph.updateState({
+                    currentNode: initialNode as ConversationNodeType,
+                    hasMetBefore: true,
+                    // Add other state properties from conversation.conversationState
+                });
+            }
+            
+            this.graphCache.set(cacheKey, graph);
+        } else {
+            // Update the current node in the existing graph
+            const graph = this.graphCache.get(cacheKey)!;
+            console.log(`Using cached graph for ${cacheKey}, updating to node: ${currentNode}`);
+            
+            // Update the graph's current node
+            graph.updateState({ currentNode });
         }
-        return this.graphCache.get(agentId)!;
+        
+        return this.graphCache.get(cacheKey)!;
     }
 
     async chat(agentId: string, userId: string, message: string) {
@@ -406,5 +227,9 @@ ${context.recentContext.map(m => `${m.role}: ${m.content}`).join('\n')}`;
             agent.slug,
             ConversationNodeType.ENTRY
         );
+    }
+
+    public async getRelevantMemories(userId: string, agentId: string, query: string): Promise<AIMemory[]> {
+        return this.memoryService.getRelevantMemories(userId, agentId, query);
     }
 } 

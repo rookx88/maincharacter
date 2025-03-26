@@ -14,6 +14,20 @@ const messageSchema = new mongoose.Schema<ChatMessage>({
     timestamp: { type: Date, default: Date.now }
 });
 
+// New schema for narrative state
+const narrativeStateSchema = new mongoose.Schema({
+    hasCompletedIntroduction: { type: Boolean, default: false },
+    relationshipStage: { 
+        type: String, 
+        enum: ['stranger', 'acquaintance', 'friend'],
+        default: 'stranger'
+    },
+    knownTopics: [String],
+    sharedStories: [String],
+    lastInteractionTimestamp: { type: Date, default: Date.now },
+    agentSpecificState: { type: Schema.Types.Mixed, default: {} }
+});
+
 export interface IConversation extends Document {
     userId: string;
     agentId: string;
@@ -26,33 +40,34 @@ export interface IConversation extends Document {
     }>;
     currentNode: string;
     conversationState: ConversationState;
+    narrativeState: {
+        hasCompletedIntroduction: boolean;
+        relationshipStage: 'stranger' | 'acquaintance' | 'friend';
+        knownTopics: string[];
+        sharedStories: string[];
+        lastInteractionTimestamp: Date;
+        agentSpecificState: Record<string, any>;
+    };
     createdAt: Date;
     updatedAt: Date;
 }
 
 export type IConversationDocument = IConversation & Document;
 
-const ConversationSchema = new Schema({
+const ConversationSchema = new Schema<IConversation>({
     userId: { type: String, required: true },
     agentId: { type: String, required: true },
     agentSlug: { type: String, required: true },
     active: { type: Boolean, default: true },
-    messages: [{
-        role: { type: String, enum: ['user', 'assistant'], required: true },
-        content: { type: String, required: true },
-        timestamp: { type: Date, default: Date.now }
-    }],
-    currentNode: { 
-        type: String, 
-        default: 'entry',
-        required: true 
-    },
+    messages: [messageSchema],
+    currentNode: { type: String, default: 'entry' },
     conversationState: {
-        storyProgress: {
-            potentialScore: { type: Number, default: 0 },
-            keyElements: [String],
-            significantMoments: [String]
-        },
+        currentNode: { type: String, default: 'entry' },
+        hasMetBefore: { type: Boolean, default: false },
+        engagementLevel: { type: Number, default: 0 },
+        revealMade: { type: Boolean, default: false },
+        userAcceptedActivity: { type: Boolean, default: false },
+        lastInteractionDate: { type: Date, default: Date.now },
         revealProgress: {
             isRevealed: { type: Boolean, default: false },
             revealTimestamp: Date,
@@ -63,6 +78,18 @@ const ConversationSchema = new Schema({
             rapport: { type: Number, default: 0 },
             interest: { type: Number, default: 0 }
         }
+    },
+    // Add the narrative state to the schema
+    narrativeState: {
+        type: narrativeStateSchema,
+        default: () => ({
+            hasCompletedIntroduction: false,
+            relationshipStage: 'stranger',
+            knownTopics: [],
+            sharedStories: [],
+            lastInteractionTimestamp: new Date(),
+            agentSpecificState: {}
+        })
     }
 }, {
     timestamps: true

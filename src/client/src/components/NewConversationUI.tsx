@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import axios from 'axios';
 import './NewConversationUI.css';
@@ -27,6 +27,8 @@ export default function NewConversationUI() {
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [isInitializing, setIsInitializing] = useState(true);
+    const [showEndModal, setShowEndModal] = useState(false);
+    const navigate = useNavigate();
 
     // Load agent profile and conversation
     useEffect(() => {
@@ -51,22 +53,40 @@ export default function NewConversationUI() {
                 // Set the agent with basic data immediately
                 setAgent(profileRes.data);
                 
-                // Get messages
-                try {
-                    const messagesRes = await axios.get(`/api/conversations/${agentSlug}/messages`, {
-                        withCredentials: true,
-                        timeout: 10000
-                    });
+                // Start a new conversation to ensure we get the initial message
+                console.log('Starting new conversation for testing');
+                const startRes = await axios.post('/api/conversations/start', 
+                    { agentSlug }, 
+                    { withCredentials: true }
+                );
+                
+                if (startRes.data?.messages && startRes.data.messages.length > 0) {
+                    console.log('Initial messages from start:', startRes.data.messages);
+                    setMessages(startRes.data.messages);
+                } else {
+                    console.log('No initial messages in start response, checking messages endpoint');
                     
-                    if (messagesRes.data?.messages) {
-                        setMessages(messagesRes.data.messages);
+                    // Fallback to getting messages if start doesn't return them
+                    try {
+                        const messagesRes = await axios.get(`/api/conversations/${agentSlug}/messages`, {
+                            withCredentials: true,
+                            timeout: 10000
+                        });
+                        
+                        console.log('Messages received:', messagesRes.data);
+                        
+                        if (messagesRes.data?.messages && messagesRes.data.messages.length > 0) {
+                            setMessages(messagesRes.data.messages);
+                            console.log(`Loaded ${messagesRes.data.messages.length} messages`);
+                        } else {
+                            console.warn('No messages found in either endpoint');
+                        }
+                    } catch (messagesError) {
+                        console.warn('Could not fetch messages:', messagesError);
                     }
-                } catch (messagesError) {
-                    console.warn('Could not fetch messages:', messagesError);
-                    // Continue with empty messages array
                 }
                 
-                // Try to get full details
+                // Get full agent details
                 try {
                     const detailsRes = await axios.get(`/api/agents/${profileRes.data.id}`, {
                         withCredentials: true,
@@ -81,11 +101,10 @@ export default function NewConversationUI() {
                     }
                 } catch (detailsError) {
                     console.warn('Could not fetch full agent details:', detailsError);
-                    // Continue with basic profile
                 }
                 
             } catch (error) {
-                console.error('Failed to load basic agent profile:', error);
+                console.error('Failed to load conversation:', error);
                 setError('Unable to load conversation. Please try again later.');
             } finally {
                 setIsInitializing(false);
@@ -109,6 +128,19 @@ export default function NewConversationUI() {
         messageCount: messages?.length
     });
 
+    // Add this at the top of the component
+    useEffect(() => {
+        // Force show the modal for testing
+        if (messages.length > 0) {
+            const lastMessage = messages[messages.length - 1];
+            if (lastMessage.role === 'assistant' && 
+                lastMessage.content.includes("I need to run now and get ready for the show")) {
+                console.log('Detected end message, showing modal');
+                setShowEndModal(true);
+            }
+        }
+    }, [messages]);
+
     // Update handleSendMessage to use LangGraph
     const handleSendMessage = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -122,31 +154,92 @@ export default function NewConversationUI() {
             setMessages(prev => [...prev, 
                 { role: 'user', content: inputMessage, timestamp: new Date() }
             ]);
+            
+            const currentMessage = inputMessage;
             setInputMessage('');
 
+            console.log('Sending message to server:', currentMessage);
+            
             const response = await axios.post('/api/conversations/message', {
-                message: inputMessage,
+                message: currentMessage,
                 agentSlug: agentSlug,
             }, {
                 withCredentials: true
             });
 
-            console.log('Backend response:', response.data);
+            console.log('Backend response (raw):', response);
+            console.log('Backend response (data):', response.data);
 
-            // Access the nested response object
-            const assistantResponse = response.data.response.response;
+            // Add more detailed logging for the conversation ended flag
+            console.log('Checking conversation ended flag:', {
+                conversationEnded: response.data.conversationEnded,
+                fullResponse: response.data
+            });
 
-            if (typeof assistantResponse === 'string') {
-                setMessages(prev => [...prev, 
-                    { role: 'assistant', content: assistantResponse, timestamp: new Date() }
-                ]);
-            } else {
-                console.error('Unexpected response format:', response.data);
+            // Force check for the end message
+            if (response.data.conversationEnded || 
+                (typeof response.data.message === 'string' && 
+                 response.data.message.includes("I need to run now and get ready for the show"))) {
+                console.log('Conversation ended, showing modal');
+                setShowEndModal(true);
             }
+
+            // Extract the message string from the response
+            let messageContent = '';
+            
+            if (typeof response.data.message === 'string') {
+                messageContent = response.data.message;
+            } else if (typeof response.data.response === 'string') {
+                messageContent = response.data.response;
+            } else if (response.data.message && response.data.message.response) {
+                messageContent = response.data.message.response;
+            } else if (response.data.response && response.data.response.response) {
+                messageContent = response.data.response.response;
+            } else {
+                console.error('Could not extract message content from response:', response.data);
+                messageContent = "Sorry, I couldn't process that message.";
+            }
+            
+            console.log('Extracted message content:', messageContent);
+            
+            // Add the AI's response to the messages
+            setMessages(prev => [...prev, 
+                { role: 'assistant', content: messageContent, timestamp: new Date() }
+            ]);
 
         } catch (error) {
             console.error('Message send error:', error);
             setError('Failed to send message');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const resetConversation = async () => {
+        try {
+            setIsLoading(true);
+            console.log('Resetting conversation for testing');
+            
+            // Delete the current conversation
+            await axios.delete(`/api/conversations/${agentSlug}`, {
+                withCredentials: true
+            });
+            
+            // Start a new conversation
+            const startRes = await axios.post('/api/conversations/start', 
+                { agentSlug }, 
+                { withCredentials: true }
+            );
+            
+            if (startRes.data?.messages) {
+                setMessages(startRes.data.messages);
+                console.log(`Started new conversation with ${startRes.data.messages.length} messages`);
+            } else {
+                setMessages([]);
+            }
+        } catch (error) {
+            console.error('Error resetting conversation:', error);
+            setError('Failed to reset conversation');
         } finally {
             setIsLoading(false);
         }
@@ -202,6 +295,16 @@ export default function NewConversationUI() {
                 </div>
             )}
 
+            <div className="chat-controls">
+                <button 
+                    className="reset-button"
+                    onClick={resetConversation}
+                    disabled={isLoading}
+                >
+                    Reset Conversation (Testing)
+                </button>
+            </div>
+
             <div className="messages-area">
                 {messages?.map((message, index) => (
                     <div key={index} className={`message ${message.role}`}>
@@ -225,6 +328,18 @@ export default function NewConversationUI() {
                     {isLoading ? 'Sending...' : 'Send'}
                 </button>
             </form>
+
+            {showEndModal && (
+                <div className="end-modal">
+                    <div className="end-modal-content">
+                        <h2>Alex had to run off to start his podcast</h2>
+                        <p>I should really come back another time...</p>
+                        <button onClick={() => navigate('/agents')}>
+                            Return to Agent Selection
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 } 

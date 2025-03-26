@@ -122,4 +122,23 @@ export interface ConversationNode {
         nextNode: ConversationNodeType;
         updatedState: Partial<ConversationState>;
     }>;
+}
+
+export interface AgentNarrativeState {
+    hasCompletedIntroduction: boolean;
+    relationshipStage: 'stranger' | 'acquaintance' | 'friend';
+    knownTopics: string[];
+    sharedStories: string[];
+    lastInteractionTimestamp: Date;
+    agentSpecificState: Record<string, any>;
+    introStage?: IntroductionStage;
+}
+
+export enum IntroductionStage {
+    INITIAL_GREETING = 'initial_greeting',
+    ESTABLISH_SCENARIO = 'establish_scenario',
+    REVEAL_CAPABILITIES = 'reveal_capabilities',
+    REQUEST_ASSISTANCE = 'request_assistance',
+    EXPRESS_GRATITUDE = 'express_gratitude',
+    ESTABLISH_RELATIONSHIP = 'establish_relationship'
 } 
