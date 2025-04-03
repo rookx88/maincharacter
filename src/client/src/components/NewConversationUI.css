@@ -370,4 +370,42 @@
 
 .end-modal-content button:hover {
     background-color: #3a80d2;
+}
+
+.suggested-responses {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px 16px;
+    background-color: rgba(15, 23, 42, 0.7);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.suggested-response {
+    background-color: rgba(59, 130, 246, 0.2);
+    color: #fff;
+    border: 1px solid rgba(59, 130, 246, 0.5);
+    border-radius: 20px;
+    padding: 8px 16px;
+    margin-right: 10px;
+    margin-bottom: 10px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-size: 0.9rem;
+    white-space: normal;
+    text-align: left;
+    max-width: 250px;
+    display: inline-block;
+}
+
+.suggested-response:hover {
+    background-color: rgba(59, 130, 246, 0.4);
+    border-color: rgba(59, 130, 246, 0.7);
+}
+
+.suggested-responses-container {
+    display: flex;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    margin-bottom: 20px;
 } 

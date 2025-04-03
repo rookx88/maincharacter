@@ -15,6 +15,8 @@ import { AgentType, ConversationState, ConversationNodeType } from '../types/con
 import mongoose from 'mongoose';
 import { ConversationNode } from '../types/conversation.js';
 import AgentModel from '../models/agentModel.js';
+import { MemoryService } from './memoryService.js';
+import { logger } from '../utils/logger.js';
 
 type Message = {
     role: "system" | "user" | "assistant";
@@ -25,13 +27,57 @@ type Message = {
 export class AIService {
     private graphCache: Map<string, EnhancedLangGraph> = new Map();
     private openai: OpenAI;
-    private memoryService: AIMemoryService;
+    private memoryService: MemoryService;
 
     constructor() {
         this.openai = new OpenAI({
             apiKey: process.env.OPENAI_API_KEY
         });
-        this.memoryService = new AIMemoryService();
+        this.memoryService = new MemoryService();
+    }
+
+    async getOrCreateGraph(
+        agentId: string, 
+        userId: string, 
+        currentNode: ConversationNodeType
+    ): Promise<EnhancedLangGraph> {
+        const cacheKey = `${userId}-${agentId}`;
+        
+        if (!this.graphCache.has(cacheKey)) {
+            // Get conversation from database to initialize with correct state
+            const conversation = await Conversation.findOne({
+                userId,
+                agentId,
+                active: true
+            });
+            
+            const agent = await agentService.getAgentById(agentId);
+            if (!agent) throw new Error('Agent not found');
+            
+            // Use existing state from database or create default
+            // IMPORTANT: For new conversations, always start with ENTRY node
+            const initialNode = conversation?.currentNode || ConversationNodeType.ENTRY;
+            
+            logger.info(`[GRAPH] Creating new graph`, {
+                userId,
+                agentId,
+                initialNode,
+                isExistingConversation: !!conversation
+            });
+            
+            const graph = new EnhancedLangGraph(agentId, {
+                initialNode: initialNode as ConversationNodeType,
+                nodes: new Map(),
+                edges: new Map(),
+                memories: [],
+                agent,
+                conversation
+            });
+            
+            this.graphCache.set(cacheKey, graph);
+        }
+        
+        return this.graphCache.get(cacheKey)!;
     }
 
     async processMessageWithGraph(
@@ -45,50 +91,50 @@ export class AIService {
         updatedState: ConversationState;
         metadata?: { conversationEnded?: boolean };
     }> {
-        console.log(`\n=== AIService: Processing message with graph ===`);
-        
+        logger.info(`[API] Processing message with graph`, {
+            userId,
+            agentSlug,
+            currentNode,
+            messagePreview: message.substring(0, 50) + (message.length > 50 ? '...' : '')
+        });
+
         const agent = await agentService.getAgentBySlug(agentSlug);
         if (!agent) throw new Error('Agent not found');
 
-        const cacheKey = `${userId}-${agent._id.toString()}`;
-        let graph = this.graphCache.get(cacheKey);
+        // Get or create the graph
+        const graph = await this.getOrCreateGraph(agent._id.toString(), userId, currentNode);
         
-        if (!graph) {
-            console.log(`Creating new graph for ${cacheKey}`);
-            graph = await this.getOrCreateGraph(agent._id.toString(), userId, currentNode);
-            this.graphCache.set(cacheKey, graph);
-        } else {
-            console.log(`Using existing graph for ${cacheKey}`);
-            graph.updateState({ currentNode });
-        }
-
-        const memories = await this.getRelevantMemories(userId, agent._id.toString(), message);
+        // Get conversation history once
         const conversationHistory = await this.getConversationHistory(userId, agent._id.toString());
         
+        // Get relevant memories once
+        const memories = await this.getRelevantMemories(userId, agent._id.toString(), message);
+        
+        // Process the input with all context in one call
         const result = await graph.processInput(message, {
             agent,
             userId,
             memories,
-            conversationHistory
+            conversationHistory,
+            currentNode
+        });
+        
+        logger.info(`[API] Graph processing result`, {
+            nextNode: result.nextNode,
+            responsePreview: result.response.substring(0, 50) + (result.response.length > 50 ? '...' : ''),
+            metadata: result.metadata
         });
         
         return result;
     }
 
-    private async getConversationHistory(userId: string, agentId: string): Promise<ChatMessage[]> {
+    async getConversationHistory(userId: string, agentId: string): Promise<ChatMessage[]> {
         const conversation = await ConversationModel.findOne({
             userId,
             agentId,
             active: true
         }).sort({ 'messages.timestamp': -1 });
-
-        // Add logging to debug conversation history
-        console.log(`Retrieved ${conversation?.messages?.length || 0} messages from conversation history`);
-        if (conversation?.messages && conversation.messages.length > 0) {
-            const lastIndex = conversation.messages.length - 1;
-            console.log(`Last message: ${conversation.messages[lastIndex]?.content || 'No content'}`);
-        }
-
+        
         return conversation?.messages || [];
     }
 
@@ -166,55 +212,6 @@ Your personality traits are: ${profile.traits?.core?.join(', ') || 'friendly and
         }
     }
 
-    private async getOrCreateGraph(agentId: string, userId: string, currentNode: ConversationNodeType): Promise<EnhancedLangGraph> {
-        const cacheKey = `${userId}-${agentId}`;
-        
-        if (!this.graphCache.has(cacheKey)) {
-            console.log(`Creating new graph for ${cacheKey}, starting at node: ${currentNode}`);
-            
-            // Get conversation from database to initialize with correct state
-            const conversation = await Conversation.findOne({
-                userId,
-                agentId,
-                active: true
-            });
-            
-            const agent = await agentService.getAgentById(agentId);
-            if (!agent) throw new Error('Agent not found');
-            
-            // Use existing state from database or create default
-            const initialNode = conversation?.currentNode || currentNode;
-            
-            const graph = new EnhancedLangGraph(agentId, {
-                initialNode: initialNode as ConversationNodeType,
-                nodes: new Map(),
-                edges: new Map(),
-                memories: [],
-                agent
-            });
-            
-            // If we have existing conversation state, update the graph
-            if (conversation?.conversationState) {
-                graph.updateState({
-                    currentNode: initialNode as ConversationNodeType,
-                    hasMetBefore: true,
-                    // Add other state properties from conversation.conversationState
-                });
-            }
-            
-            this.graphCache.set(cacheKey, graph);
-        } else {
-            // Update the current node in the existing graph
-            const graph = this.graphCache.get(cacheKey)!;
-            console.log(`Using cached graph for ${cacheKey}, updating to node: ${currentNode}`);
-            
-            // Update the graph's current node
-            graph.updateState({ currentNode });
-        }
-        
-        return this.graphCache.get(cacheKey)!;
-    }
-
     async chat(agentId: string, userId: string, message: string) {
         console.log("AIService processing:", { agentId, userId, message });
         
@@ -230,6 +227,6 @@ Your personality traits are: ${profile.traits?.core?.join(', ') || 'friendly and
     }
 
     public async getRelevantMemories(userId: string, agentId: string, query: string): Promise<AIMemory[]> {
-        return this.memoryService.getRelevantMemories(userId, agentId, query);
+        return this.memoryService.searchMemories(userId, agentId, query);
     }
 } 

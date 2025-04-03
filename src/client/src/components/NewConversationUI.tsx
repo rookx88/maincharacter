@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import axios from 'axios';
+import api from '../api/config';
 import './NewConversationUI.css';
 
 interface Message {
@@ -28,7 +28,7 @@ export default function NewConversationUI() {
     const [error, setError] = useState<string | null>(null);
     const [isInitializing, setIsInitializing] = useState(true);
     const [showEndModal, setShowEndModal] = useState(false);
-    const navigate = useNavigate();
+    const [suggestedResponses, setSuggestedResponses] = useState<string[]>([]);
 
     // Load agent profile and conversation
     useEffect(() => {
@@ -43,10 +43,7 @@ export default function NewConversationUI() {
                 setIsInitializing(true);
                 
                 // Get the basic agent info
-                const profileRes = await axios.get(`/api/agents/by-slug/${agentSlug}`, {
-                    withCredentials: true,
-                    timeout: 10000
-                });
+                const profileRes = await api.get(`/agents/by-slug/${agentSlug}`);
                 
                 console.log('Basic profile received:', profileRes.data);
                 
@@ -55,9 +52,8 @@ export default function NewConversationUI() {
                 
                 // Start a new conversation to ensure we get the initial message
                 console.log('Starting new conversation for testing');
-                const startRes = await axios.post('/api/conversations/start', 
-                    { agentSlug }, 
-                    { withCredentials: true }
+                const startRes = await api.post('/conversations/start', 
+                    { agentSlug }
                 );
                 
                 if (startRes.data?.messages && startRes.data.messages.length > 0) {
@@ -68,10 +64,7 @@ export default function NewConversationUI() {
                     
                     // Fallback to getting messages if start doesn't return them
                     try {
-                        const messagesRes = await axios.get(`/api/conversations/${agentSlug}/messages`, {
-                            withCredentials: true,
-                            timeout: 10000
-                        });
+                        const messagesRes = await api.get(`/conversations/${agentSlug}/messages`);
                         
                         console.log('Messages received:', messagesRes.data);
                         
@@ -88,10 +81,7 @@ export default function NewConversationUI() {
                 
                 // Get full agent details
                 try {
-                    const detailsRes = await axios.get(`/api/agents/${profileRes.data.id}`, {
-                        withCredentials: true,
-                        timeout: 10000
-                    });
+                    const detailsRes = await api.get(`/agents/${profileRes.data.id}`);
                     
                     if (detailsRes.data) {
                         setAgent(prevAgent => ({
@@ -128,12 +118,14 @@ export default function NewConversationUI() {
         messageCount: messages?.length
     });
 
-    // Add this at the top of the component
+    // Replace the problematic useEffect
     useEffect(() => {
         // Force show the modal for testing
-        if (messages.length > 0) {
+        if (Array.isArray(messages) && messages.length > 0) {
             const lastMessage = messages[messages.length - 1];
-            if (lastMessage.role === 'assistant' && 
+            if (lastMessage && 
+                lastMessage.role === 'assistant' && 
+                typeof lastMessage.content === 'string' &&
                 lastMessage.content.includes("I need to run now and get ready for the show")) {
                 console.log('Detected end message, showing modal');
                 setShowEndModal(true);
@@ -141,77 +133,218 @@ export default function NewConversationUI() {
         }
     }, [messages]);
 
-    // Update handleSendMessage to use LangGraph
+    // Add this useEffect to log when suggestedResponses changes
+    useEffect(() => {
+        console.log('Suggested responses updated:', suggestedResponses);
+    }, [suggestedResponses]);
+
+    // Add this function to log network requests
+    const logNetworkRequest = async (url: string, method: string, data: any) => {
+        console.group(`Network Request: ${method} ${url}`);
+        console.log('Request data:', data);
+        
+        try {
+            const response = await api({
+                method,
+                url,
+                data
+            });
+            
+            console.log('Response status:', response.status);
+            console.log('Response data:', response.data);
+            console.groupEnd();
+            
+            return response;
+        } catch (error) {
+            console.error('Request failed:', error);
+            console.groupEnd();
+            throw error;
+        }
+    };
+
+    // Add this function to test the response format
+    const testResponseFormat = (data: any) => {
+        console.group('Response Format Test');
+        console.log('Raw data:', data);
+        console.log('Type of data:', typeof data);
+        console.log('Type of data.response:', typeof data.response);
+        
+        if (typeof data.response === 'string') {
+            console.log('Response is a string:', data.response);
+        } else if (typeof data.response === 'object') {
+            console.log('Response is an object with keys:', Object.keys(data.response));
+            console.log('Type of data.response.response:', typeof data.response.response);
+        }
+        
+        console.log('Metadata:', data.metadata || data.response?.metadata);
+        console.groupEnd();
+        
+        // Return the appropriate response text
+        return typeof data.response === 'string' 
+            ? data.response 
+            : (data.response?.response || "No response content");
+    };
+
+    // Update the handleSendMessage function to better handle the sequence
     const handleSendMessage = async (e: React.FormEvent) => {
-        e.preventDefault();
-
-        if (!inputMessage.trim() || !user || !agentSlug) return;
-
+        if (e && typeof e.preventDefault === 'function') {
+            e.preventDefault();
+        }
+        
+        if (!inputMessage.trim() || isLoading || !user) return;
+        
         try {
             setIsLoading(true);
             
-            // Add user message immediately
-            setMessages(prev => [...prev, 
-                { role: 'user', content: inputMessage, timestamp: new Date() }
-            ]);
-            
-            const currentMessage = inputMessage;
+            // Add the user message to the UI immediately
+            const userMessage = {
+                role: 'user' as const,
+                content: inputMessage,
+                timestamp: new Date()
+            };
+            setMessages(prev => [...prev, userMessage]);
             setInputMessage('');
-
-            console.log('Sending message to server:', currentMessage);
             
-            const response = await axios.post('/api/conversations/message', {
-                message: currentMessage,
-                agentSlug: agentSlug,
-            }, {
-                withCredentials: true
-            });
-
-            console.log('Backend response (raw):', response);
-            console.log('Backend response (data):', response.data);
-
-            // Add more detailed logging for the conversation ended flag
-            console.log('Checking conversation ended flag:', {
-                conversationEnded: response.data.conversationEnded,
-                fullResponse: response.data
-            });
-
-            // Force check for the end message
-            if (response.data.conversationEnded || 
-                (typeof response.data.message === 'string' && 
-                 response.data.message.includes("I need to run now and get ready for the show"))) {
-                console.log('Conversation ended, showing modal');
-                setShowEndModal(true);
-            }
-
-            // Extract the message string from the response
-            let messageContent = '';
+            console.log('Sending message to API:', inputMessage);
             
-            if (typeof response.data.message === 'string') {
-                messageContent = response.data.message;
-            } else if (typeof response.data.response === 'string') {
-                messageContent = response.data.response;
-            } else if (response.data.message && response.data.message.response) {
-                messageContent = response.data.message.response;
-            } else if (response.data.response && response.data.response.response) {
-                messageContent = response.data.response.response;
+            // Send the message to the API
+            const response = await api.post('/conversations/message', {
+                message: inputMessage,
+                agentSlug
+            });
+            
+            console.log('Full API response:', response);
+            
+            // From the server logs, we can see the response format is:
+            // { response: "Nice to meet you! I don't think I caught your name?", nextNode: 'entry', metadata: { suggestedResponses: [] } }
+            
+            // Check if we have a response
+            if (response.data) {
+                // Test the response format
+                const aiResponseText = testResponseFormat(response.data);
+                
+                console.log('AI response text:', aiResponseText);
+                
+                // Add the AI message to the UI
+                const aiMessage = {
+                    role: 'assistant' as const,
+                    content: aiResponseText,
+                    timestamp: new Date()
+                };
+                
+                console.log('Adding AI message to UI:', aiMessage);
+                
+                // Update messages with the new AI message
+                setMessages(prev => [...prev, aiMessage]);
+                
+                // Get metadata from the appropriate location
+                const metadata = response.data.metadata || response.data.response?.metadata || {};
+                console.log('Extracted metadata:', metadata);
+                
+                // Handle suggested responses - only set if they exist and are non-empty
+                if (metadata && Array.isArray(metadata.suggestedResponses) && metadata.suggestedResponses.length > 0) {
+                    console.log('Setting suggested responses:', metadata.suggestedResponses);
+                    setSuggestedResponses(metadata.suggestedResponses);
+                } else {
+                    console.log('No suggested responses found in metadata or empty array');
+                    setSuggestedResponses([]);
+                }
+                
+                // Check for conversation end
+                if (metadata?.conversationEnded) {
+                    setShowEndModal(true);
+                }
             } else {
-                console.error('Could not extract message content from response:', response.data);
-                messageContent = "Sorry, I couldn't process that message.";
+                console.error('No data in response:', response);
             }
             
-            console.log('Extracted message content:', messageContent);
-            
-            // Add the AI's response to the messages
-            setMessages(prev => [...prev, 
-                { role: 'assistant', content: messageContent, timestamp: new Date() }
-            ]);
-
         } catch (error) {
-            console.error('Message send error:', error);
-            setError('Failed to send message');
+            console.error('Error sending message:', error);
+            
+            // Add more detailed error logging
+            if (error && typeof error === 'object') {
+                const apiError = error as any;
+                if (apiError.response) {
+                    // The request was made and the server responded with a status code
+                    // that falls out of the range of 2xx
+                    console.error('Response error data:', apiError.response.data);
+                    console.error('Response error status:', apiError.response.status);
+                } else if (apiError.request) {
+                    // The request was made but no response was received
+                    console.error('Request error:', apiError.request);
+                } else if (apiError.message) {
+                    // Something happened in setting up the request that triggered an Error
+                    console.error('Error message:', apiError.message);
+                }
+            } else {
+                console.error('Unknown error:', error);
+            }
+            
+            setError('Failed to send message. Please try again.');
         } finally {
             setIsLoading(false);
+        }
+    };
+
+    // Update the handleSuggestedResponseClick function
+    const handleSuggestedResponseClick = async (response: string) => {
+        try {
+            // Clear suggested responses immediately
+            setSuggestedResponses([]);
+            
+            // Add the user message to the UI immediately
+            const userMessage = {
+                role: 'user' as const,
+                content: response,
+                timestamp: new Date()
+            };
+            setMessages(prev => [...prev, userMessage]);
+            
+            // Send the message to the API directly without setting inputMessage
+            console.log('Sending suggested response to API:', response);
+            
+            // Send the message to the API
+            const apiResponse = await api.post('/conversations/message', {
+                message: response,
+                agentSlug
+            });
+            
+            console.log('Full API response:', apiResponse);
+            
+            // Process the response as usual
+            if (apiResponse.data) {
+                const aiResponseText = testResponseFormat(apiResponse.data);
+                
+                console.log('AI response text:', aiResponseText);
+                
+                const aiMessage = {
+                    role: 'assistant' as const,
+                    content: aiResponseText,
+                    timestamp: new Date()
+                };
+                
+                console.log('Adding AI message to UI:', aiMessage);
+                setMessages(prev => [...prev, aiMessage]);
+                
+                // Handle metadata
+                const metadata = apiResponse.data.metadata || {};
+                console.log('Extracted metadata:', metadata);
+                
+                if (metadata && Array.isArray(metadata.suggestedResponses) && metadata.suggestedResponses.length > 0) {
+                    console.log('Setting suggested responses:', metadata.suggestedResponses);
+                    setSuggestedResponses(metadata.suggestedResponses);
+                } else {
+                    console.log('No suggested responses found in metadata or empty array');
+                    setSuggestedResponses([]);
+                }
+                
+                if (metadata?.conversationEnded) {
+                    setShowEndModal(true);
+                }
+            }
+        } catch (error) {
+            console.error('Error sending suggested response:', error);
+            setError('Failed to send message. Please try again.');
         }
     };
 
@@ -221,14 +354,11 @@ export default function NewConversationUI() {
             console.log('Resetting conversation for testing');
             
             // Delete the current conversation
-            await axios.delete(`/api/conversations/${agentSlug}`, {
-                withCredentials: true
-            });
+            await api.delete(`/conversations/${agentSlug}`);
             
             // Start a new conversation
-            const startRes = await axios.post('/api/conversations/start', 
-                { agentSlug }, 
-                { withCredentials: true }
+            const startRes = await api.post('/conversations/start', 
+                { agentSlug }
             );
             
             if (startRes.data?.messages) {
@@ -242,6 +372,38 @@ export default function NewConversationUI() {
             setError('Failed to reset conversation');
         } finally {
             setIsLoading(false);
+        }
+    };
+
+    // At the top of the component, add this function
+    const safelyRenderMessages = () => {
+        try {
+            if (!Array.isArray(messages)) {
+                console.error("Messages is not an array:", messages);
+                return <div className="error-message">Error loading messages</div>;
+            }
+            
+            console.log('Rendering messages:', messages);
+            
+            return messages.map((message, index) => {
+                console.log(`Message ${index}:`, message);
+                
+                if (!message) {
+                    console.error(`Message ${index} is undefined`);
+                    return <div key={index} className="message error">Invalid message</div>;
+                }
+                
+                return (
+                    <div key={index} className={`message ${message.role || 'unknown'}`}>
+                        <div className="message-content">
+                            {typeof message.content === 'string' ? message.content : 'No content'}
+                        </div>
+                    </div>
+                );
+            });
+        } catch (error) {
+            console.error("Error rendering messages:", error);
+            return <div className="error-message">Error rendering messages</div>;
         }
     };
 
@@ -306,12 +468,26 @@ export default function NewConversationUI() {
             </div>
 
             <div className="messages-area">
-                {messages?.map((message, index) => (
-                    <div key={index} className={`message ${message.role}`}>
-                        <div className="message-content">{message.content}</div>
-                    </div>
-                ))}
+                {safelyRenderMessages()}
             </div>
+
+            {Array.isArray(suggestedResponses) && suggestedResponses.length > 0 && (
+                <div className="suggested-responses">
+                    <p className="suggested-responses-title">Suggested responses:</p>
+                    {suggestedResponses.map((response, index) => {
+                        console.log(`Rendering suggested response ${index}:`, response);
+                        return (
+                            <button 
+                                key={index}
+                                className="suggested-response-btn"
+                                onClick={() => handleSuggestedResponseClick(response)}
+                            >
+                                {response}
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
 
             <form onSubmit={handleSendMessage} className="message-input">
                 <input
@@ -334,7 +510,7 @@ export default function NewConversationUI() {
                     <div className="end-modal-content">
                         <h2>Alex had to run off to start his podcast</h2>
                         <p>I should really come back another time...</p>
-                        <button onClick={() => navigate('/agents')}>
+                        <button onClick={() => window.location.href = '/agents'}>
                             Return to Agent Selection
                         </button>
                     </div>

@@ -12,13 +12,18 @@ import { TimePeriod } from '../types/common.js';
 import { AIMemory } from '../types/aiMemory.js';
 import { OpenAI } from 'openai';
 import ConversationModel from '../models/conversationModel.js';
+import MemoryFragmentModel from '../models/memoryFragmentModel.js';
 import { AgentNarrativeState, IntroductionStage } from '../types/conversation.js';
 import mongoose from 'mongoose';
+import { logger } from '../utils/logger.js';
+import { getTimePeriod } from './timeUtils.js';
+import { MemoryFragmentService } from '../services/memoryFragmentService.js';
 
 interface IntroductionPrompt {
     agentMessage: string;
     expectedResponseType: string;
     fallbackPrompt: string;
+    suggestedResponses?: string[];
 }
 
 export interface Edge {
@@ -33,31 +38,1053 @@ export interface EnhancedLangGraphConfig {
     edges: Map<string, Edge>;
     memories: AIMemory[];
     agent?: AIAgent;
+    conversation?: any; // Add this line
+}
+
+// Create a dedicated IntroductionFlowManager class
+class IntroductionFlowManager {
+    private narrativeStates: Map<string, AgentNarrativeState>;
+    private narrativeStateModel: any;
+    
+    constructor(private agentId: string, private graph: EnhancedLangGraph) {
+        this.narrativeStates = new Map();
+        this.narrativeStateModel = mongoose.model('Conversation');
+    }
+    
+    // Process the introduction flow
+    async processFlow(
+        message: string,
+        context: any,
+        narrativeState: AgentNarrativeState
+    ): Promise<{
+        response: string;
+        nextNode: ConversationNodeType;
+        updatedState: ConversationState;
+        metadata?: { 
+            conversationEnded?: boolean;
+            suggestedResponses?: string[];
+        };
+    }> {
+        // Get the current stage
+        const currentStage = narrativeState.introStage || IntroductionStage.INITIAL_GREETING;
+        const sessionKey = this.graph.getSessionKey(context.userId, this.agentId);
+        
+        // Check if we should handle this with the dedicated method
+        const introFlowResult = await this.handleIntroductionFlow(message, context, sessionKey, narrativeState);
+        if (introFlowResult) {
+            return introFlowResult;
+        }
+        
+        // Start memory extraction from SEEK_HELP stage
+        if (currentStage === IntroductionStage.SEEK_HELP || 
+            currentStage === IntroductionStage.FIRST_FRAGMENT) {
+            
+            // Extract memory details and store in narrative state
+            const memoryDetails = await this.extractMemoryDetails(message);
+            if (memoryDetails) {
+                narrativeState.memoryDetails = {
+                    ...narrativeState.memoryDetails || {},
+                    ...memoryDetails
+                };
+                
+                // Log what information we've gathered and what's missing
+                const missingFields = this.identifyMissingFields(narrativeState.memoryDetails);
+                logger.info(`[FLOW] Memory details updated`, {
+                    memoryDetails: narrativeState.memoryDetails,
+                    missingFields
+                });
+                
+                // Save the updated narrative state
+                await this.saveNarrativeState(context.userId, narrativeState);
+            }
+        }
+        
+        // Special handling for the final stage
+        if (currentStage === IntroductionStage.ESTABLISH_RELATIONSHIP) {
+            // Use our new handler for the final stage
+            const result = await this.handleIntroductionFlow(message, context, sessionKey, narrativeState);
+            if (result) {
+                return result;
+            }
+        }
+        
+        // Track repeat count
+        narrativeState.stageRepeatCount = narrativeState.stageRepeatCount || 0;
+        
+        logger.info(`[FLOW] Processing introduction flow - Stage: ${currentStage}`, {
+            userId: context.userId,
+            message: message,
+            repeatCount: narrativeState.stageRepeatCount
+        });
+        
+        // Check if we should advance to the next stage based on the user's message
+        if (this.shouldAdvanceStage(message, currentStage)) {
+            // Reset repeat count when advancing
+            narrativeState.stageRepeatCount = 0;
+            
+            // Get the next stage
+            const nextStage = this.getNextStage(currentStage);
+            
+            // Update the narrative state
+            narrativeState.introStage = nextStage;
+            await this.saveNarrativeState(context.userId, narrativeState);
+            
+            // Log the stage transition
+            logger.info(`[FLOW] Advanced to stage: ${nextStage}, generating response for this stage`);
+            
+            // If we've advanced to the final stage, handle it specially
+            if (nextStage === IntroductionStage.ESTABLISH_RELATIONSHIP) {
+                const sessionKey = this.graph.getSessionKey(context.userId, this.agentId);
+                return this.handleIntroductionFlow(message, context, sessionKey, narrativeState);
+            }
+            
+            // Generate the response for the next stage
+            const response = this.generateStageResponse(nextStage, context, message);
+            
+            // Generate suggested responses based on the current stage
+            const suggestedResponses = this.generateSuggestedResponses(currentStage);
+            
+            // Return a properly structured response - KEEP IN ENTRY NODE during introduction
+            return {
+                response,
+                nextNode: ConversationNodeType.ENTRY,
+                updatedState: {
+                    currentNode: ConversationNodeType.ENTRY,
+                    hasMetBefore: false,
+                    engagementLevel: 0,
+                    revealMade: false,
+                    userAcceptedActivity: false,
+                    lastInteractionDate: new Date()
+                },
+                metadata: {
+                    suggestedResponses
+                }
+            };
+        }
+        
+        // Increment repeat count
+        narrativeState.stageRepeatCount += 1;
+        await this.saveNarrativeState(context.userId, narrativeState);
+        
+        // If we've repeated too many times, force advancement
+        if (narrativeState.stageRepeatCount >= 3) {
+            logger.info(`[FLOW] Forcing stage advancement after ${narrativeState.stageRepeatCount} attempts`);
+            
+            // Get the next stage
+            const nextStage = this.getNextStage(currentStage);
+            
+            // Update the narrative state
+            narrativeState.introStage = nextStage;
+            narrativeState.stageRepeatCount = 0;
+            await this.saveNarrativeState(context.userId, narrativeState);
+            
+            // Generate the response for the next stage
+            const response = this.generateStageResponse(nextStage, context, message);
+            
+            return {
+                response,
+                nextNode: ConversationNodeType.ENTRY,
+                updatedState: {
+                    currentNode: ConversationNodeType.ENTRY,
+                    hasMetBefore: false,
+                    engagementLevel: 0,
+                    revealMade: false,
+                    userAcceptedActivity: false,
+                    lastInteractionDate: new Date()
+                }
+            };
+        }
+        
+        // If we shouldn't advance, generate a follow-up for the current stage
+        const followUp = this.generateFollowUp(message, currentStage, context.agent.slug);
+        
+        // Return a properly structured response - KEEP IN ENTRY NODE during introduction
+        return {
+            response: followUp || this.generateStageResponse(currentStage, context, message),
+            nextNode: ConversationNodeType.ENTRY,
+            updatedState: {
+                currentNode: ConversationNodeType.ENTRY,
+                hasMetBefore: false,
+                engagementLevel: 0,
+                revealMade: false,
+                userAcceptedActivity: false,
+                lastInteractionDate: new Date()
+            },
+            metadata: {
+                suggestedResponses: this.generateSuggestedResponses(currentStage) || []
+            }
+        };
+    }
+    
+    // Check if we should advance to the next stage
+    private shouldAdvanceStage(message: string, currentStage: IntroductionStage): boolean {
+        // For INITIAL_GREETING, check for greeting pattern AND a name
+        if (currentStage === IntroductionStage.INITIAL_GREETING) {
+            const hasGreeting = /\b(hi|hello|hey|greetings|howdy|good morning|good afternoon|good evening)\b/i.test(message);
+            const possibleName = this.extractName(message);
+            
+            logger.info(`[FLOW] Checking greeting criteria`, {
+                hasGreeting,
+                possibleName,
+                message
+            });
+            
+            // Only advance if we have a name (greeting is optional)
+            return !!possibleName;
+        }
+        
+        // If we're at the final stage, don't advance further
+        if (currentStage === IntroductionStage.ESTABLISH_RELATIONSHIP) {
+            return false;
+        }
+        
+        // For ESTABLISH_SCENARIO, check for expression of interest or sympathy
+        if (currentStage === IntroductionStage.ESTABLISH_SCENARIO) {
+            const hasInterest = /\b(sorry|that's too bad|that's unfortunate|what will you do|how can I help|need help|oh no)\b/i.test(message);
+            
+            logger.info(`[FLOW] Checking interest criteria`, {
+                hasInterest
+            });
+            
+            return hasInterest;
+        }
+        
+        // For SEEK_HELP, check if the response is substantial
+        if (currentStage === IntroductionStage.SEEK_HELP) {
+            // Reduced character requirement from 50 to 30
+            const isSubstantial = message.length > 30;
+            const hasStoryIndicator = /\b(once|remember|happened|story|experience|time when|when i|i was)\b/i.test(message);
+            
+            logger.info(`[FLOW] Checking story criteria`, {
+                isSubstantial,
+                hasStoryIndicator,
+                messageLength: message.length
+            });
+            
+            return (isSubstantial || hasStoryIndicator) && !this.isNegativeResponse(message);
+        }
+        
+        // For FIRST_FRAGMENT, check if the response contains details
+        if (currentStage === IntroductionStage.FIRST_FRAGMENT) {
+            const hasTimeIndicator = /\b(year|month|day|when|time|ago|before|after|during|yesterday|today|tomorrow|week|weekend|night|morning|evening|afternoon)\b/i.test(message);
+            const hasPlaceIndicator = /\b(at|in|place|location|where|city|town|country|home|house|building|street|road|avenue|park|store|shop|restaurant|cafe|school|college|university|work|office|hospital|hotel)\b/i.test(message);
+            
+            logger.info(`[FLOW] Checking detail criteria`, {
+                hasTimeIndicator,
+                hasPlaceIndicator
+            });
+            
+            return hasTimeIndicator || hasPlaceIndicator;
+        }
+        
+        // For EXPRESS_GRATITUDE, check for acknowledgment
+        if (currentStage === IntroductionStage.EXPRESS_GRATITUDE) {
+            const hasAcknowledgment = /\b(welcome|no problem|glad to help|anytime|my pleasure|happy to|of course|sure)\b/i.test(message);
+            
+            logger.info(`[FLOW] Checking acknowledgment criteria`, {
+                hasAcknowledgment
+            });
+            
+            return true; // Always advance, but log if acknowledgment was found
+        }
+        
+        // For all other stages, any response advances
+        return true;
+    }
+    
+    // Get the next stage in the sequence
+    private getNextStage(currentStage: IntroductionStage): IntroductionStage {
+        // Map of stages to their next stage
+        const stageProgression: Record<IntroductionStage, IntroductionStage> = {
+            [IntroductionStage.INITIAL_GREETING]: IntroductionStage.ESTABLISH_SCENARIO,
+            [IntroductionStage.ESTABLISH_SCENARIO]: IntroductionStage.SEEK_HELP,
+            [IntroductionStage.SEEK_HELP]: IntroductionStage.FIRST_FRAGMENT,
+            [IntroductionStage.FIRST_FRAGMENT]: IntroductionStage.FOLLOW_UP,
+            [IntroductionStage.FOLLOW_UP]: IntroductionStage.EXPRESS_GRATITUDE,
+            [IntroductionStage.EXPRESS_GRATITUDE]: IntroductionStage.ESTABLISH_RELATIONSHIP,
+            // Don't advance from ESTABLISH_RELATIONSHIP - it's the final stage
+            [IntroductionStage.ESTABLISH_RELATIONSHIP]: IntroductionStage.ESTABLISH_RELATIONSHIP
+        };
+        
+        return stageProgression[currentStage];
+    }
+    
+    // Generate a response for a specific stage
+    private generateStageResponse(stage: IntroductionStage, context: any, userMessage: string): string {
+        const introMessage = this.getIntroductionMessage(context.agent, stage);
+        
+        // Log the intro message for debugging
+        logger.info(`[FLOW] Generating response for stage ${stage}`, {
+            agentSlug: context.agent.slug,
+            messageTemplate: introMessage?.agentMessage?.substring(0, 50) + '...'
+        });
+        
+        // Check if we have a valid intro message
+        if (!introMessage || !introMessage.agentMessage) {
+            logger.error(`[FLOW] Missing intro message for stage ${stage} and agent ${context.agent.slug}`);
+            return `I'm sorry, I seem to be having trouble with my thoughts right now. Could you give me a moment?`;
+        }
+        
+        let response = introMessage.agentMessage;
+        
+        // Replace placeholders
+        response = response.replace('{userName}', this.extractName(context) || 'there');
+        
+        // For FIRST_FRAGMENT, include the user's story
+        if (stage === IntroductionStage.FIRST_FRAGMENT) {
+            response = response.replace('{userStory}', userMessage);
+        }
+        
+        return response;
+    }
+    
+    // Generate a follow-up if needed
+    private generateFollowUp(message: string, stage: IntroductionStage, agentSlug: string): string | null {
+        // Special case for INITIAL_GREETING without a name
+        if (stage === IntroductionStage.INITIAL_GREETING) {
+            const hasGreeting = /\b(hi|hello|hey|greetings|howdy|good morning|good afternoon|good evening)\b/i.test(message);
+            const possibleName = this.extractName(message);
+            
+            if (hasGreeting && !possibleName) {
+                return "Nice to meet you! I don't think I caught your name?";
+            }
+        }
+        
+        // Check if the response is negative or minimal
+        const isNegativeResponse = this.isNegativeResponse(message);
+        const isMinimalResponse = message.length < 20;
+        
+        logger.info(`[FLOW] Checking if follow-up needed`, {
+            messageLength: message.length,
+            isNegativeResponse,
+            isMinimalResponse,
+            stage
+        });
+        
+        // For stages that require substantial responses, be more strict
+        if ((stage === IntroductionStage.SEEK_HELP || 
+             stage === IntroductionStage.FIRST_FRAGMENT || 
+             stage === IntroductionStage.EXPRESS_GRATITUDE) && 
+            (isNegativeResponse || isMinimalResponse)) {
+            
+            // Get follow-up prompts for the current agent and stage
+            const followUpPrompts = this.getFollowUpPrompts(agentSlug, stage, isNegativeResponse);
+            
+            // If we have prompts, randomly select one
+            if (followUpPrompts && followUpPrompts.length > 0) {
+                const selectedPrompt = followUpPrompts[Math.floor(Math.random() * followUpPrompts.length)];
+                logger.info(`[FLOW] Selected follow-up prompt`, { prompt: selectedPrompt });
+                return selectedPrompt;
+            }
+        }
+        
+        return null;
+    }
+    
+    // Check if a response is negative
+    private isNegativeResponse(message: string): boolean {
+        const negativePatterns = [
+            /\b(no|nope|not really|don't have|haven't|can't think|nothing comes to mind)\b/i,
+            /\b(boring|normal|ordinary|usual|typical|nothing special|nothing interesting)\b/i,
+            /\b(i don't know|not sure|maybe|i guess|probably not)\b/i
+        ];
+        
+        return negativePatterns.some(pattern => pattern.test(message));
+    }
+    
+    // Extract user name from context
+    
+    
+    // Get introduction message for a specific stage
+    private getIntroductionMessage(agent: any, stage: IntroductionStage): IntroductionPrompt {
+        // Define introduction messages for each agent and stage
+        const introMessages: Record<string, Record<IntroductionStage, IntroductionPrompt>> = {
+            'alex-rivers': {
+                [IntroductionStage.INITIAL_GREETING]: {
+                    agentMessage: "Oh! Hi there! I'm Alex Rivers from the Life Stories podcast. Sorry if I seem a bit frazzled at the moment...",
+                    expectedResponseType: "greeting",
+                    fallbackPrompt: "I didn't catch your name. What should I call you?"
+                },
+                [IntroductionStage.ESTABLISH_SCENARIO]: {
+                    agentMessage: "I'm actually in a bit of a bind. I'm supposed to record an episode today about memorable life experiences, but my guest just canceled. I'm trying to figure out what to do now.",
+                    expectedResponseType: "acknowledgment",
+                    fallbackPrompt: "Have you ever had something important fall through at the last minute?",
+                    suggestedResponses: [
+                        "Oh no, that's unfortunate",
+                        "Sorry to hear that. What will you do?",
+                        "That sounds stressful. How can I help?"
+                    ]
+                },
+                [IntroductionStage.SEEK_HELP]: {
+                    agentMessage: "You know what? Since you're here, maybe you could help me out. I know we just met and everything but I could really use a lifeline here. What do you say?",
+                    expectedResponseType: "agreement",
+                    fallbackPrompt: "You'd really be doing me a solid... please?",
+                    suggestedResponses: [
+                        "Sure, I'll help",
+                        "I don't know...",
+                        "What would I need to do?"
+                    ]
+                },
+                [IntroductionStage.FIRST_FRAGMENT]: {
+                    agentMessage: "My listeners love a good time piece, can you think of an extraordinary historic event you've lived through? I know for me I can't help but think of the fact I lived to see Space X catching a re-usable rocket! What comes to mind for you?",
+                    expectedResponseType: "story",
+                    fallbackPrompt: "It doesn't have to be something huge - sometimes it's the unexpected small moments that make the best stories. Maybe something surprising that happened to you?"
+                },
+                [IntroductionStage.FOLLOW_UP]: {
+                    agentMessage: "That's fascinating! Tell me more about when and where this happened. The context adds so much to a story.",
+                    expectedResponseType: "details",
+                    fallbackPrompt: "Could you share a bit more about when and where this took place?"
+                },
+                [IntroductionStage.EXPRESS_GRATITUDE]: {
+                    agentMessage: "This is gold! *excitedly taking notes* Thank you so much for sharing that. It's exactly the kind of authentic story our listeners connect with.",
+                    expectedResponseType: "acknowledgment",
+                    fallbackPrompt: "How do you feel about sharing your story with others?",
+                    suggestedResponses: [
+                        "You're welcome",
+                        "Happy to help",
+                        "No problem"
+                    ]
+                },
+                [IntroductionStage.ESTABLISH_RELATIONSHIP]: {
+                    agentMessage: "You know, you have a real gift for storytelling. I'd love to have you back on the show sometime to explore more of your experiences. Would that be something you'd be interested in?",
+                    expectedResponseType: "agreement",
+                    fallbackPrompt: "Either way, I really appreciate your help today.",
+                    suggestedResponses: [
+                        "I'd like that",
+                        "Maybe another time",
+                        "Thanks for the offer"
+                    ]
+                }
+            },
+            'chef-isabella': {
+                [IntroductionStage.INITIAL_GREETING]: {
+                    agentMessage: "Oh! Hello there! I'm Isabella, just finishing up some prep work for a special dinner tonight.",
+                    expectedResponseType: "greeting",
+                    fallbackPrompt: "I didn't catch your name. What should I call you?"
+                },
+                [IntroductionStage.ESTABLISH_SCENARIO]: {
+                    agentMessage: "I'm working on a new recipe that's meant to evoke powerful memories through food. It's for a special client who wants to recreate a meaningful moment from their past.",
+                    expectedResponseType: "acknowledgment",
+                    fallbackPrompt: "Have you ever had a meal that brought back strong memories?"
+                },
+                [IntroductionStage.SEEK_HELP]: {
+                    agentMessage: "Actually, since you're here, maybe you could help me with some inspiration. Is there a particular meal or dish that brings back strong memories for you?",
+                    expectedResponseType: "food memory",
+                    fallbackPrompt: "Everyone has at least one food memory. Maybe a holiday meal or something your family made?"
+                },
+                [IntroductionStage.FIRST_FRAGMENT]: {
+                    agentMessage: "That sounds fascinating! Could you tell me more about when and where you experienced this? The context adds so much flavor to the story.",
+                    expectedResponseType: "details",
+                    fallbackPrompt: "When did you first experience this dish? What was happening in your life then?"
+                },
+                [IntroductionStage.EXPRESS_GRATITUDE]: {
+                    agentMessage: "Thank you so much for sharing that! Food memories are so powerful, aren't they? You've given me some wonderful inspiration for my recipe.",
+                    expectedResponseType: "acknowledgment",
+                    fallbackPrompt: "Do you often connect food with important memories like this?"
+                },
+                [IntroductionStage.ESTABLISH_RELATIONSHIP]: {
+                    agentMessage: "I really appreciate your help with this! I need to get back to my prep work now, but I'd love to chat again sometime about food and memories!",
+                    expectedResponseType: "farewell",
+                    fallbackPrompt: "Would you be interested in sharing more food stories sometime?"
+                },
+                [IntroductionStage.FOLLOW_UP]: {
+                    agentMessage: "That sounds wonderful! Could you tell me more about when this happened? What year was it, and what made this food experience so special to you?",
+                    expectedResponseType: "story_details",
+                    fallbackPrompt: "Even just a general timeframe would help. Was this recent or from a while back?"
+                }
+            },
+            'morgan-chase': {
+                [IntroductionStage.INITIAL_GREETING]: {
+                    agentMessage: "Oh, hi! I didn't see you there. I'm Morgan Chase, just sorting through some fabric swatches for my new collection.",
+                    expectedResponseType: "greeting",
+                    fallbackPrompt: "I didn't catch your name. What should I call you?"
+                },
+                [IntroductionStage.ESTABLISH_SCENARIO]: {
+                    agentMessage: "I'm working on a new concept for my collection - fashion pieces inspired by significant moments in people's lives. I want each piece to tell a story.",
+                    expectedResponseType: "acknowledgment",
+                    fallbackPrompt: "Have you ever had an outfit that reminded you of a special moment?"
+                },
+                [IntroductionStage.SEEK_HELP]: {
+                    agentMessage: "Actually, since you're here, maybe you could help me with some inspiration. Is there a particular moment or experience from your life that stands out as especially meaningful?",
+                    expectedResponseType: "story",
+                    fallbackPrompt: "Everyone has meaningful moments. Perhaps a celebration, achievement, or even a challenging time you overcame?"
+                },
+                [IntroductionStage.FIRST_FRAGMENT]: {
+                    agentMessage: "That's fascinating! Could you tell me more about when and where this happened? The setting adds so much context to the story.",
+                    expectedResponseType: "details",
+                    fallbackPrompt: "When did this take place? What was the environment like?"
+                },
+                [IntroductionStage.EXPRESS_GRATITUDE]: {
+                    agentMessage: "Thank you so much for sharing that! Personal stories like yours are exactly what inspire my best designs. You've given me some wonderful ideas.",
+                    expectedResponseType: "acknowledgment",
+                    fallbackPrompt: "Do you often find connections between your experiences and your personal style?"
+                },
+                [IntroductionStage.ESTABLISH_RELATIONSHIP]: {
+                    agentMessage: "I really appreciate your help with this! I need to get back to my design work now, but I'd love to chat again sometime about life and style!",
+                    expectedResponseType: "farewell",
+                    fallbackPrompt: "Would you be interested in discussing fashion inspiration again sometime?"
+                },
+                [IntroductionStage.FOLLOW_UP]: {
+                    agentMessage: "That's intriguing! Could you tell me more about when this was? What year, and what made this particular clothing item or outfit so meaningful to you?",
+                    expectedResponseType: "story_details",
+                    fallbackPrompt: "Even just a rough idea of when this happened would be helpful. Was it recently or some time ago?"
+                }
+            }
+        };
+        
+        // Get the messages for this agent, or use a default if not found
+        const agentMessages = introMessages[agent.slug] || introMessages['alex-rivers'];
+        
+        // Return the message for this stage, or a default if not found
+        return agentMessages[stage] || {
+            agentMessage: `I'm ${agent.name}, and I'm interested in learning more about you.`,
+            expectedResponseType: "any",
+            fallbackPrompt: "Could you tell me a bit about yourself?"
+        };
+    }
+    
+    // Get follow-up prompts
+    private getFollowUpPrompts(agentSlug: string, stage: IntroductionStage, isNegative: boolean): string[] {
+        // Define follow-up prompts for each agent and stage
+        const followUpPrompts: Record<string, Record<IntroductionStage, { positive: string[], negative: string[] }>> = {
+            'alex-rivers': {
+                [IntroductionStage.SEEK_HELP]: {
+                    positive: [
+                        "It doesn't have to be anything extraordinary. Maybe something that made you laugh, or a small moment that stuck with you?",
+                        "Even a simple story about your day could work! Our listeners love authentic moments. What's something that happened to you recently?",
+                        "How about something from your childhood? Or maybe a recent experience that surprised you?"
+                    ],
+                    negative: [
+                        "I understand it might feel awkward to share. But honestly, even small everyday stories can be fascinating. Maybe something that happened this week?",
+                        "No pressure, but I've found that everyone has stories worth telling - even if they don't realize it. Maybe something about a hobby or interest?",
+                        "That's okay! Sometimes it's hard to think of something on the spot. What about a recent vacation, or even just a memorable meal you had?"
+                    ]
+                },
+                [IntroductionStage.FIRST_FRAGMENT]: {
+                    positive: [
+                        "Could you tell me a bit more about when and where this happened? Those details really help paint a picture.",
+                        "That's interesting! When did this take place? And where were you at the time?",
+                        "I'd love to know more about the setting. When and where did this happen?"
+                    ],
+                    negative: [
+                        "Even just a general timeframe would help - was this recent or from a while ago? And where did it take place?",
+                        "No need for exact dates, but was this something from your childhood, or more recent? And where were you?",
+                        "Just to help set the scene for our listeners - roughly when did this happen, and where were you at the time?"
+                    ]
+                },
+                [IntroductionStage.EXPRESS_GRATITUDE]: {
+                    positive: [
+                        "That's exactly the kind of authentic story our listeners connect with. Has sharing this brought back any other memories?",
+                        "Thank you for that! It's these personal moments that make for the best episodes. How do you feel looking back on this now?",
+                        "That's perfect for what I need! Do you often share stories like this with others?"
+                    ],
+                    negative: [
+                        "Thanks for sharing that. Even brief stories can resonate with people. Do you have any other thoughts about it?",
+                        "I appreciate you helping me out here. Even short stories can be meaningful to listeners. Any final thoughts about it?",
+                        "Thank you - that's actually exactly what I needed. Sometimes the simplest stories are the most relatable. Anything else you'd add?"
+                    ]
+                },
+                [IntroductionStage.INITIAL_GREETING]: { positive: [], negative: [] },
+                [IntroductionStage.ESTABLISH_SCENARIO]: { positive: [], negative: [] },
+                [IntroductionStage.ESTABLISH_RELATIONSHIP]: { positive: [], negative: [] },
+                [IntroductionStage.FOLLOW_UP]: {
+                    positive: [
+                        "The details really bring your story to life. Can you share more about how this experience affected you?",
+                        "That's fascinating context. How did this moment change your perspective?"
+                    ],
+                    negative: [
+                        "Even just a general sense of when this happened would help our listeners picture it.",
+                        "Don't worry about exact details - just share what you remember most vividly."
+                    ]
+                }
+            },
+            // Add other agents here with similar structure
+        };
+        
+        // Get the prompts for this agent, or use alex-rivers as default
+        const agentPrompts = followUpPrompts[agentSlug] || followUpPrompts['alex-rivers'];
+        
+        // Get the prompts for this stage
+        const stagePrompts = agentPrompts[stage];
+        if (!stagePrompts) {
+            return [];
+        }
+        
+        // Return the appropriate prompts based on whether the response was negative
+        return isNegative ? stagePrompts.negative : stagePrompts.positive;
+    }
+    
+    // Save narrative state to database
+    private async saveNarrativeState(userId: string, narrativeState: AgentNarrativeState): Promise<any> {
+        try {
+            return await this.narrativeStateModel.findOneAndUpdate(
+                { userId, agentId: this.agentId, active: true },
+                { $set: { narrativeState } },
+                { new: true }
+            );
+        } catch (error) {
+            console.error('Error saving narrative state:', error);
+            throw error;
+        }
+    }
+
+    // Add a method to handle the final stage completion
+    async handleFinalStage(
+        userId: string,
+        narrativeState: AgentNarrativeState,
+        context: any
+    ): Promise<{
+        response: string;
+        nextNode: ConversationNodeType;
+        updatedState: ConversationState;
+        metadata: { 
+            conversationEnded: boolean;
+            memoryFragmentId?: string;
+        };
+    }> {
+        logger.info('[FLOW] Handling final introduction stage', {
+            userId,
+            agentSlug: context.agent.slug
+        });
+        
+        // Get the memory details from the narrative state
+        let memoryDetails = narrativeState.memoryDetails || {};
+        
+        // If we don't have memory details, extract them from the conversation history
+        if (!memoryDetails.description) {
+            const conversationHistory = context.conversationHistory || [];
+            const userMessages = conversationHistory
+                .filter((msg: ChatMessage) => msg.role === 'user')
+                .map((msg: ChatMessage) => msg.content)
+                .join("\n");
+            
+            // Extract memory details using AI
+            memoryDetails = await this.extractMemoryDetails(userMessages) || {};
+        }
+        
+        // Create a memory fragment
+        let memoryFragmentId: string | undefined = undefined;
+        try {
+            // Create a new memory fragment
+            const memoryFragment = new MemoryFragmentModel({
+                title: memoryDetails.title || "Shared story",
+                description: memoryDetails.description || "A story shared during conversation",
+                date: {
+                    timestamp: new Date(),
+                    approximateDate: memoryDetails.date?.approximateDate || "Unknown",
+                    timePeriod: getTimePeriod(new Date())
+                },
+                location: {
+                    name: memoryDetails.location?.name || "Unknown location"
+                },
+                people: memoryDetails.people || [],
+                tags: memoryDetails.themes || [],
+                context: {
+                    emotions: memoryDetails.context?.emotions || [],
+                    significance: memoryDetails.significance || 3,
+                    themes: memoryDetails.themes || []
+                },
+                system: {
+                    userId,
+                    created: new Date(),
+                    updatedAt: new Date(),
+                    version: 1
+                },
+                status: "needs_details",
+                missingFields: this.identifyMissingFields(memoryDetails),
+                conversationId: context.conversationId
+            });
+            
+            // Save the memory fragment to the database
+            await memoryFragment.save();
+            
+            logger.info(`[FLOW] Created memory fragment`, {
+                id: memoryFragment._id,
+                title: memoryFragment.title
+            });
+            
+            memoryFragmentId = memoryFragment._id;
+        } catch (error) {
+            logger.error(`[FLOW] Error creating memory fragment`, error);
+        }
+        
+        // Mark the introduction as completed
+        narrativeState.hasCompletedIntroduction = true;
+        narrativeState.relationshipStage = 'acquaintance';
+        
+        // Save the updated state
+        await this.saveNarrativeState(userId, narrativeState);
+        
+        logger.info('[FLOW] Introduction completed, returning final response with conversationEnded: true');
+        
+        // Return the completion response with transition to CASUAL_CONVERSATION
+        return {
+            response: "I really appreciate your help today! I promise I will make it up to you but I need to run now and get ready for the show. Hope to catch up with you again soon!",
+            nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+            updatedState: {
+                currentNode: ConversationNodeType.CASUAL_CONVERSATION,
+                hasMetBefore: true,
+                engagementLevel: 0,
+                revealMade: true,
+                userAcceptedActivity: true,
+                lastInteractionDate: new Date()
+            },
+            metadata: {
+                conversationEnded: true,
+                memoryFragmentId
+            }
+        };
+    }
+
+    // Add a method to extract memory details using AI
+    private async extractMemoryDetails(message: string): Promise<any> {
+        try {
+            const openai = new OpenAI({
+                apiKey: process.env.OPENAI_API_KEY
+            });
+            
+            const response = await openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [
+                    {
+                        role: "system",
+                        content: `Extract memory details from the user's story. Return a JSON object with these fields:
+                        - title: A short title for the memory
+                        - description: A brief description of the event
+                        - date: { timestamp: null, approximateDate: "string description of when it happened" }
+                        - location: { name: "location name or description" }
+                        - people: [{ name: "person name", relationship: "relationship to user" }]
+                        - emotions: ["emotion1", "emotion2"]
+                        - significance: number from 1-5
+                        - themes: ["theme1", "theme2"]
+                        
+                        Only include fields if they can be reasonably inferred from the text. Use null for missing values.`
+                    },
+                    {
+                        role: "user",
+                        content: message
+                    }
+                ],
+                response_format: { type: "json_object" }
+            });
+            
+            const content = response.choices[0].message.content;
+            const memoryDetails = content ? JSON.parse(content) : null;
+            return memoryDetails;
+        } catch (error) {
+            logger.error(`[FLOW] Error extracting memory details`, error);
+            return null;
+        }
+    }
+
+    // Add a method to create a memory fragment
+    private async createMemoryFragment(userId: string, storyText: string, conversationHistory: any[]): Promise<void> {
+        try {
+            // Extract key details from the story
+            const details = await this.extractMemoryDetails(storyText);
+            
+            // Create a new memory fragment
+            const memoryFragment = {
+                title: details.title || "Memorable Experience",
+                description: storyText,
+                date: {
+                    timestamp: details.date || new Date(),
+                    approximateDate: details.approximateDate || "Unknown",
+                    timePeriod: details.timePeriod || "RECENT"
+                },
+                location: {
+                    name: details.location || "Unknown location"
+                },
+                people: details.people || [],
+                tags: details.tags || [],
+                context: {
+                    emotions: details.emotions || [],
+                    significance: details.significance || 3,
+                    themes: details.themes || []
+                },
+                system: {
+                    userId: userId,
+                    created: new Date(),
+                    version: 1
+                },
+                status: "needs_details",
+                missingFields: ["location", "date.timestamp"]
+            };
+            
+            // Save the memory fragment to the database
+            const MemoryFragmentModel = mongoose.model('MemoryFragment');
+            const newFragment = new MemoryFragmentModel(memoryFragment);
+            await newFragment.save();
+            
+            console.log(`[DEBUG] Created memory fragment: ${newFragment._id}`);
+            
+            // Store the memory fragment ID in the narrative state
+            const narrativeState = this.narrativeStates.get(userId) || {
+                hasCompletedIntroduction: false,
+                relationshipStage: "stranger",
+                knownTopics: [],
+                sharedStories: [],
+                lastInteractionTimestamp: new Date(),
+                agentSpecificState: {}
+            };
+            
+            narrativeState.memoryDetails = {
+                fragmentId: newFragment._id,
+                created: true,
+                updated: false
+            };
+            
+            this.narrativeStates.set(userId, narrativeState);
+            await this.saveNarrativeState(userId, narrativeState);
+            
+        } catch (error) {
+            console.error('[ERROR] Failed to create memory fragment:', error);
+        }
+    }
+
+    // Add a method to identify missing fields
+    private identifyMissingFields(memoryDetails: any): string[] {
+        const missingFields = [];
+        
+        if (!memoryDetails.date?.approximateDate) missingFields.push("date");
+        if (!memoryDetails.location?.name) missingFields.push("location");
+        if (!memoryDetails.description) missingFields.push("description");
+        
+        return missingFields;
+    }
+
+    // Add a method to generate suggested responses
+    private generateSuggestedResponses(stage: IntroductionStage): string[] {
+        switch (stage) {
+            case IntroductionStage.INITIAL_GREETING:
+                return []; // No suggested responses for initial greeting
+            
+            case IntroductionStage.ESTABLISH_SCENARIO:
+                return [
+                    "Oh no, that's unfortunate",
+                    "Sorry to hear that. What will you do?",
+                    "That sounds stressful. How can I help?"
+                ];
+            
+            case IntroductionStage.SEEK_HELP:
+                return [
+                    "Sure, I'd be happy to help",
+                    "What kind of help do you need?",
+                    "I'm not sure I'd be good at that"
+                ];
+            
+            case IntroductionStage.FIRST_FRAGMENT:
+                return [
+                    "I have a story about something similar",
+                    "I'd be happy to share my experience",
+                    "What kind of story are you looking for?"
+                ];
+            
+            case IntroductionStage.EXPRESS_GRATITUDE:
+                return [
+                    "You're welcome! Glad I could help",
+                    "No problem at all",
+                    "Happy to share my experience"
+                ];
+            
+            case IntroductionStage.ESTABLISH_RELATIONSHIP:
+                return [
+                    "Sounds good! Good luck with the show",
+                    "It was nice meeting you, Alex",
+                    "Hope to talk again soon"
+                ];
+            
+            default:
+                return [];
+        }
+    }
+
+    // Add this method to the IntroductionFlowManager class
+    private extractName(input: any): string | null {
+        // If input is not a string, return null
+        if (typeof input !== 'string') {
+            console.warn('extractName received non-string input:', input);
+            return null;
+        }
+        
+        const message = input;
+        
+        // Check for direct name statements
+        const namePatterns = [
+            /my name is (\w+)/i,
+            /i am (\w+)/i,
+            /i'm (\w+)/i,
+            /call me (\w+)/i,
+            /it's (\w+)/i,
+            /this is (\w+)/i,
+            /(\w+) here/i
+        ];
+
+        for (const pattern of namePatterns) {
+            const match = message.match(pattern);
+            if (match && match[1]) {
+                // Ensure the first letter is capitalized
+                return match[1].charAt(0).toUpperCase() + match[1].slice(1);
+            }
+        }
+
+        // If no direct statement, look for names in the message
+        const words = message.split(/\s+/);
+        for (const word of words) {
+            // Check if word starts with capital letter and is at least 3 chars
+            if (word.length >= 3 && 
+                word[0] === word[0].toUpperCase() && 
+                word[0] !== word[0].toLowerCase()) {
+                return word;
+            }
+        }
+
+        return null;
+    }
+
+    // Add this to handle the final stage properly
+    public async handleIntroductionFlow(
+        message: string,
+        context: any,
+        sessionKey: string,
+        narrativeState: AgentNarrativeState
+    ): Promise<any> {
+        // Get the current stage from narrative state
+        const currentStage = narrativeState.introStage || IntroductionStage.INITIAL_GREETING;
+        
+        // Check if we're at the final stage and user has accepted
+        if (currentStage === IntroductionStage.ESTABLISH_RELATIONSHIP && 
+            this.isPositiveResponse(message)) {
+            
+            // Mark introduction as complete
+            narrativeState.hasCompletedIntroduction = true;
+            await this.saveNarrativeState(context.userId, narrativeState);
+            
+            logger.info(`[FLOW] Introduction completed for user ${context.userId}`);
+            
+            // Log memory fragment details if available
+            if (narrativeState.memoryDetails?.fragmentId) {
+                logger.info(`[MEMORY] Memory fragment created during introduction`, {
+                    fragmentId: narrativeState.memoryDetails.fragmentId,
+                    userId: context.userId,
+                    agentId: this.agentId
+                });
+            } else {
+                logger.warn(`[MEMORY] No memory fragment ID found in narrative state`);
+            }
+            
+            // Return a final response with conversationEnded flag
+            return {
+                response: "That's wonderful! I'm looking forward to our future conversations. I need to run now and get ready for the show, but feel free to reach out anytime you want to chat about life experiences!",
+                nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                updatedState: {
+                    currentNode: ConversationNodeType.CASUAL_CONVERSATION,
+                    hasMetBefore: true,
+                    engagementLevel: 4,
+                    revealMade: false,
+                    userAcceptedActivity: false,
+                    lastInteractionDate: new Date()
+                },
+                metadata: {
+                    conversationEnded: true,  // Add this flag to trigger the modal
+                    suggestedResponses: []
+                }
+            };
+        }
+        
+        return null; // Return null if not handling this case
+    }
+
+    // Add this helper method
+    public isPositiveResponse(message: string): boolean {
+        const positivePatterns = [
+            /yes/i, /sure/i, /okay/i, /ok/i, /definitely/i, /absolutely/i,
+            /i'?d like that/i, /sounds good/i, /that works/i, /happy to/i
+        ];
+        
+        return positivePatterns.some(pattern => pattern.test(message));
+    }
+
+    // Add this helper method to IntroductionFlowManager
+    private getSessionKey(userId: string, agentId: string): string {
+        return `${userId}-${agentId}`;
+    }
+
+    // In the IntroductionFlowManager class
+    public async advanceToNextStage(nextStage: IntroductionStage, userId: string, narrativeState: AgentNarrativeState): Promise<any> {
+        // Update the narrative state with the new stage
+        narrativeState.introStage = nextStage;
+        narrativeState.stageRepeatCount = 0; // Reset repeat count
+        
+        // Save the updated state
+        await this.saveNarrativeState(userId, narrativeState);
+        
+        logger.info(`[FLOW] Advanced to stage: ${nextStage}`, {
+            userId,
+            previousStage: narrativeState.introStage,
+            newStage: nextStage
+        });
+        
+        // Generate response for the new stage
+        return this.generateStageResponse(nextStage, { userId }, "");
+    }
+
+    // Add this method to the IntroductionFlowManager class
+    public evaluateStoryQuality(message: string): boolean {
+        // Simple implementation - check if the message is long enough to be a story
+        if (message.length < 50) {
+            return false;
+        }
+        
+        // Check for narrative elements
+        const narrativePatterns = [
+            /when/i, /then/i, /after/i, /before/i, /during/i,
+            /happened/i, /occurred/i, /experienced/i, /remember/i,
+            /felt/i, /thought/i, /realized/i, /decided/i
+        ];
+        
+        const hasNarrativeElements = narrativePatterns.some(pattern => pattern.test(message));
+        
+        return hasNarrativeElements;
+    }
 }
 
 export class EnhancedLangGraph {
     private nodes: Map<ConversationNodeType, ConversationNode>;
-    private agent?: AIAgent;  // Make optional with ?
-    private memoryService: MemoryService;
+    private agent?: AIAgent;
+    private memoryService: MemoryService = new MemoryService();
     private currentState: ConversationState;
     private openai: OpenAI;
     private narrativeStates: Map<string, AgentNarrativeState> = new Map();
-    private activeIntroSessions: Map<string, IntroductionStage> = new Map();
     private narrativeStateModel: any;
+    private introFlowManager: IntroductionFlowManager;
+    
+    // Add these missing properties
+    private edges: Map<string, Edge> = new Map();
+    private memories: AIMemory[] = [];
+    private activeIntroSessions: Map<string, IntroductionStage> = new Map();
+    private initialNode: ConversationNodeType;
+    private conversation: any;
+    private agentId: string;
 
     constructor(
-        private agentId: string,
-        private config: EnhancedLangGraphConfig
+        agentId: string,
+        config: EnhancedLangGraphConfig
     ) {
-        this.nodes = config.nodes;
-        this.memoryService = new MemoryService();
-        this.openai = new OpenAI({
-            apiKey: process.env.OPENAI_API_KEY
-        });
+        this.nodes = config.nodes || new Map();
+        this.edges = config.edges || new Map();
+        this.memories = config.memories || [];
+        this.agent = config.agent;
+        this.agentId = agentId;
+        this.initialNode = config.initialNode;
+        this.conversation = config.conversation;
         
-        // Initialize with config values but allow for updates
+        // Initialize the narrative state model
+        this.narrativeStateModel = mongoose.model('Conversation');
+        
+        // Initialize the current state
         this.currentState = {
-            currentNode: config.initialNode,
+            currentNode: this.initialNode,
             hasMetBefore: false,
             engagementLevel: 0,
             revealMade: false,
@@ -65,11 +1092,119 @@ export class EnhancedLangGraph {
             lastInteractionDate: new Date()
         };
         
-        this.agent = config.agent;
-        this.initializeNodes();
+        // Initialize the OpenAI client
+        this.openai = new OpenAI({
+            apiKey: process.env.OPENAI_API_KEY
+        });
         
-        // Initialize the narrative state model
-        this.narrativeStateModel = mongoose.model('AgentNarrativeState');
+        // Initialize the introduction flow manager
+        this.introFlowManager = new IntroductionFlowManager(this.agentId, this);
+        
+        // Initialize the conversation nodes
+        this.initializeConversationNodes();
+        
+        logger.info(`[GRAPH] Graph initialized`, {
+            agentId: this.agentId,
+            initialNode: this.initialNode,
+            hasConversation: !!this.conversation
+        });
+    }
+    
+    // Add the missing extractAndSaveStoryDetails method
+    private async extractAndSaveStoryDetails(userId: string, conversationHistory: ChatMessage[]): Promise<void> {
+        if (!conversationHistory || conversationHistory.length < 4) {
+            return; // Not enough conversation to extract details
+        }
+        
+        try {
+            // Find the request for a story and the user's response
+            let storyPrompt = '';
+            let storyResponse = '';
+            
+            for (let i = 0; i < conversationHistory.length - 1; i++) {
+                const message = conversationHistory[i];
+                
+                // Look for the AI asking for a story
+                if (message.role === 'assistant' && 
+                    (message.content.includes("memorable experience") || 
+                     message.content.includes("tell me about a time") || 
+                     message.content.includes("share a story") ||
+                     message.content.includes("tell me more about when and where"))) {
+                    
+                    // The next message should contain time/location details
+                    if (i + 1 < conversationHistory.length && conversationHistory[i + 1].role === 'user') {
+                        storyPrompt = message.content;
+                        storyResponse = conversationHistory[i + 1].content;
+                        break;
+                    }
+                }
+            }
+            
+            if (!storyResponse) {
+                return; // No story found
+            }
+            
+            // Use OpenAI to extract key details
+            const prompt = `
+                Extract key details from this story:
+                "${storyResponse}"
+                
+                Return a JSON object with:
+                - timeframe: When this happened (year or period)
+                - location: Where this happened
+                - emotions: Main emotions expressed
+                - significance: Why this seems important to the person
+                - topics: Key topics or themes
+            `;
+            
+            const completion = await this.openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.3,
+                max_tokens: 500
+            });
+            
+            const content = completion.choices[0]?.message?.content;
+            if (!content) {
+                return;
+            }
+            
+            // Parse the JSON response
+            try {
+                const details = JSON.parse(content);
+                
+                // Save as a memory
+                await this.memoryService.createMemory({
+                    userId,
+                    agentId: this.agentId,
+                    content: storyResponse,
+                    source: 'conversation',
+                    type: 'personal_story',
+                    metadata: {
+                        timeframe: details.timeframe,
+                        location: details.location,
+                        emotions: details.emotions,
+                        significance: details.significance,
+                        topics: details.topics
+                    },
+                    importance: 8, // Personal stories are important
+                    createdAt: new Date()
+                });
+                
+                logger.info(`[MEMORY] Extracted and saved story details`, {
+                    userId,
+                    agentId: this.agentId,
+                    timeframe: details.timeframe,
+                    topics: details.topics
+                });
+                
+            } catch (error) {
+                logger.error(`[MEMORY] Error parsing story details`, error);
+            }
+            
+        } catch (error) {
+            logger.error(`[MEMORY] Error extracting story details`, error);
+        }
     }
 
     private initializeNodes() {
@@ -79,7 +1214,7 @@ export class EnhancedLangGraph {
             nodeType: 'greeting',
             content: "Welcome! How can I help you today?",
             responses: ["Hi!", "Hello!"],
-            nextNodes: [ConversationNodeType.FIRST_MEETING],
+            nextNodes: [ConversationNodeType.CASUAL_CONVERSATION],
             handler: async (message: string, state: ConversationState, context: any) => {
                 console.log('Entry node handler executing:', { 
                     currentNode: state.currentNode,
@@ -93,40 +1228,10 @@ export class EnhancedLangGraph {
                     
                 return {
                     response,
-                    nextNode: ConversationNodeType.FIRST_MEETING,  // Important: Must transition
-                    updatedState: {
-                        ...state,
-                        hasMetBefore: true
-                    }
-                };
-            }
-        });
-
-        // First Meeting Node
-        this.nodes.set(ConversationNodeType.FIRST_MEETING, {
-            id: ConversationNodeType.FIRST_MEETING,
-            nodeType: 'dialogue',
-            content: '',
-            responses: [],
-            nextNodes: [ConversationNodeType.CASUAL_CONVERSATION],
-            handler: async (message, state, context) => {
-                console.log('FIRST_MEETING handler - Context:', context);
-                console.log('FIRST_MEETING handler - State:', state);
-
-                const response = await this.generateResponse(
-                    `You are ${context.agent?.name}, a ${context.agent?.category} professional. 
-                     This is your first time meeting this person.
-                     Respond naturally to: "${message}"`,
-                    context
-                );
-
-                return {
-                    response,
                     nextNode: ConversationNodeType.CASUAL_CONVERSATION,
                     updatedState: {
                         ...state,
-                        hasMetBefore: true,
-                        engagementLevel: 0.7
+                        hasMetBefore: true
                     }
                 };
             }
@@ -176,7 +1281,7 @@ export class EnhancedLangGraph {
                         description: message,
                         date: {
                             timestamp: new Date(),
-                            timePeriod: TimePeriod.Present
+                            timePeriod: getTimePeriod(new Date())
                         },
                         context: {
                             emotions: await this.detectEmotions(message),
@@ -219,7 +1324,7 @@ export class EnhancedLangGraph {
                     description: `Revealed ${this.getAgentActivity()} opportunity`,
                     date: {
                         timestamp: new Date(),
-                        timePeriod: TimePeriod.Present
+                        timePeriod: getTimePeriod(new Date())
                     },
                     context: {
                         emotions: ['excited', 'encouraging'],
@@ -283,45 +1388,59 @@ export class EnhancedLangGraph {
         return ['interested']; // Placeholder
     }
 
+    // Create a unified response generation system
     private async generateResponse(
         prompt: string,
-        context: {
-            recentMessages: Message[];
-            relevantMemories: AIMemory[];
-            agent: AIAgent;
-        }
+        context: any,
+        options: {
+            temperature?: number;
+            maxTokens?: number;
+            includeMemories?: boolean;
+            includeHistory?: boolean;
+        } = {}
     ): Promise<string> {
-        const recentContext = context.recentMessages.slice(-5).map(msg => ({
-            role: msg.role as 'system' | 'user' | 'assistant',
-            content: msg.content
-        }));
-
-        const messages = [
-            {
-                role: 'system' as const,
-                content: `You are ${context.agent.name}, a ${context.agent.category} professional.
-                         Your personality: ${context.agent.traits?.core?.join(', ')}
-                         Current conversation state: ${this.currentState.hasMetBefore ? 'Continuing conversation' : 'First meeting'}
-                         Engagement level: ${this.currentState.engagementLevel}
-                         
-                         Maintain conversation context and avoid repeating introductions if you've already met.
-                         Respond naturally and stay in character.`
-            },
-            ...recentContext,
-            {
-                role: 'user' as const,
-                content: prompt
-            }
-        ];
-
-        const completion = await this.openai.chat.completions.create({
-            model: "gpt-4",
-            messages: messages,
-            temperature: 0.7,
-            max_tokens: 150
-        });
-
-        return completion.choices[0].message.content || "I'm not sure how to respond to that.";
+        const { temperature = 0.7, maxTokens = 500, includeMemories = true, includeHistory = true } = options;
+        
+        // Build the system message
+        let systemMessage = `You are ${context.agent?.name}, a ${context.agent?.category} professional.`;
+        
+        // Add agent personality if available
+        if (context.agent?.personality) {
+            systemMessage += `\n\nPersonality: ${context.agent.personality}`;
+        }
+        
+        // Add memories if requested
+        let memoryContext = '';
+        if (includeMemories && context.memories && context.memories.length > 0) {
+            memoryContext = '\n\nRelevant memories:\n' + 
+                context.memories.map((m: AIMemory) => `- ${m.content}`).join('\n');
+        }
+        
+        // Add conversation history if requested
+        let historyContext = '';
+        if (includeHistory && context.conversationHistory && context.conversationHistory.length > 0) {
+            // Only include the last few messages to avoid token limits
+            const recentHistory = context.conversationHistory.slice(-5);
+            historyContext = '\n\nRecent conversation:\n' + 
+                recentHistory.map((m: ChatMessage) => `${m.role === 'user' ? 'User' : 'You'}: ${m.content}`).join('\n');
+        }
+        
+        // Combine all context
+        const fullPrompt = `${systemMessage}\n${memoryContext}\n${historyContext}\n\n${prompt}`;
+        
+        try {
+            const response = await this.openai.chat.completions.create({
+                model: 'gpt-4o',
+                messages: [{ role: 'system', content: fullPrompt }],
+                temperature,
+                max_tokens: maxTokens
+            });
+            
+            return response.choices[0]?.message?.content || "I'm not sure how to respond to that.";
+        } catch (error) {
+            console.error('Error generating response:', error);
+            return "I'm having trouble processing that right now.";
+        }
     }
 
     private createFirstMeetingPrompt(): string {
@@ -424,6 +1543,27 @@ Respond naturally while staying in character.`;
         return prompts[activity] || "Let's explore this activity together...";
     }
 
+    // Add this function to fix the suggested responses timing
+    private fixSuggestedResponsesTiming(result: any, currentStage: IntroductionStage): any {
+        // If we're at ESTABLISH_SCENARIO, we need to attach the suggested responses
+        if (currentStage === IntroductionStage.ESTABLISH_SCENARIO) {
+            console.log('[DEBUG] Fixing suggested responses timing for ESTABLISH_SCENARIO');
+            
+            // Hardcode the responses since we can't access the private method
+            result.metadata = result.metadata || {};
+            result.metadata.suggestedResponses = [
+                "Oh no, that's unfortunate",
+                "Sorry to hear that. What will you do?",
+                "That sounds stressful. How can I help?"
+            ];
+            
+            console.log('[DEBUG] Added suggested responses to result:', result.metadata.suggestedResponses);
+        }
+        
+        return result;
+    }
+
+    // Update the processInput method to use the new function
     async processInput(
         message: string,
         context: {
@@ -431,6 +1571,7 @@ Respond naturally while staying in character.`;
             userId: string;
             memories?: AIMemory[];
             conversationHistory?: ChatMessage[];
+            currentNode?: ConversationNodeType;
         }
     ): Promise<{
         response: string;
@@ -438,217 +1579,194 @@ Respond naturally while staying in character.`;
         updatedState: ConversationState;
         metadata?: { conversationEnded?: boolean };
     }> {
-        console.log('=== EnhancedLangGraph Processing ===');
-        console.log(`User message: "${message}"`);
-        
-        // Remove the TESTING cache clear
-        // TESTING: Clear graph cache to force new graph creation
-        // const cacheKey = `${context.userId}-${this.agentId}`;
-        // this.graphCache.delete(cacheKey);
-        
-        // Initialize narrative state
+        // Get or initialize narrative state
         const sessionKey = this.getSessionKey(context.userId, this.agentId);
-        const narrativeState = await this.initializeNarrativeState(context.userId);
+        let narrativeState = await this.getNarrativeState(context.userId);
         
-        // Check if we've already completed the introduction
-        const hasCompletedIntro = narrativeState.hasCompletedIntroduction;
-        
-        // TESTING: Only force introduction mode if we haven't completed it yet
-        if (!hasCompletedIntro) {
-            narrativeState.hasCompletedIntroduction = false;
-            narrativeState.relationshipStage = 'stranger';
-            await this.saveNarrativeState(context.userId, narrativeState);
+        // Sync the current node from the database if needed
+        if (context.currentNode && this.currentState.currentNode !== context.currentNode) {
+            logger.info(`[FLOW] Syncing current node from database: ${context.currentNode} (was: ${this.currentState.currentNode})`);
+            this.currentState.currentNode = context.currentNode;
         }
         
-        console.log('Narrative state (TESTING MODE):', {
+        logger.info(`[FLOW] Processing input for agent ${context.agent.slug}`, {
+            userId: context.userId,
+            currentNode: this.currentState.currentNode,
             hasCompletedIntro: narrativeState.hasCompletedIntroduction,
-            relationshipStage: narrativeState.relationshipStage,
-            introStage: this.getCurrentIntroductionStage(context.conversationHistory || [])
+            introStage: narrativeState.introStage,
+            message: message.substring(0, 50) + (message.length > 50 ? '...' : '')
         });
         
-        // For testing, use introduction flow only if not completed
-        let result;
-        if (!narrativeState.hasCompletedIntroduction) {
-            result = await this.handleIntroductionFlow(message, context, sessionKey, narrativeState);
-        } else {
-            // Use casual conversation flow
-            result = await this.handleCasualConversation(message, context, narrativeState);
+
+        const shouldUseIntroFlow = 
+            !narrativeState.hasCompletedIntroduction && 
+            narrativeState.introStage && 
+            this.currentState.currentNode === ConversationNodeType.ENTRY;
+        
+        logger.info(`[FLOW] Flow decision`, {
+            shouldUseIntroFlow,  // Use the variable that's defined in this scope
+            condition1: !narrativeState.hasCompletedIntroduction,
+            condition2: !!narrativeState.introStage,
+            condition3: this.currentState.currentNode === ConversationNodeType.ENTRY
+        });
+        
+        if (shouldUseIntroFlow) {
+            const currentStage = this.getIntroductionStage(context.userId) || IntroductionStage.INITIAL_GREETING;
+            logger.info(`[FLOW] Using introduction flow - Stage: ${currentStage}`);
+            
+            // Process the message using the introduction flow
+            let result = await this.handleIntroductionFlow(
+                message,
+                context,
+                context.userId,
+                await this.getNarrativeState(context.userId)
+            );
+            
+            // Fix the suggested responses timing
+            result = this.fixSuggestedResponsesTiming(result, currentStage);
+            
+            // Log the result to verify suggested responses are included
+            logger.info(`[FLOW] Introduction flow result`, {
+                nextNode: result.nextNode,
+                responsePreview: result.response.substring(0, 50) + "...",
+                metadata: result.metadata
+            });
+            
+            // Force the next node to be CASUAL_CONVERSATION to ensure proper transition
+            result.nextNode = ConversationNodeType.CASUAL_CONVERSATION;
+            result.updatedState = {
+                ...result.updatedState,
+                currentNode: ConversationNodeType.CASUAL_CONVERSATION
+            };
+            
+            return result;
         }
         
-        // Log the AI response
-        console.log(`AI response (${result.nextNode}): "${result.response}"`);
+        logger.info(`[FLOW] Using regular conversation flow - Node: ${this.currentState.currentNode}`);
+        
+        // If we're not in the introduction flow or it's already completed,
+        // handle regular conversation
+        const result = await this.processRegularConversation(message, context, narrativeState);
+        
+        logger.info(`[FLOW] Regular conversation result`, {
+            nextNode: result.nextNode,
+            responsePreview: result.response.substring(0, 50) + (result.response.length > 50 ? '...' : ''),
+            metadata: result.metadata
+        });
         
         return result;
     }
 
-    // Update the handleIntroductionFlow method to better handle negative responses
+    // Update the handleIntroductionFlow method
     private async handleIntroductionFlow(
         message: string,
-        context: {
-            agent: AIAgent;
-            userId: string;
-            memories?: AIMemory[];
-            conversationHistory?: ChatMessage[];
-        },
+        context: any,
         sessionKey: string,
         narrativeState: AgentNarrativeState
-    ): Promise<{
-        response: string;
-        nextNode: ConversationNodeType;
-        updatedState: ConversationState;
-        metadata?: { conversationEnded?: boolean };
-    }> {
-        // Get current stage from narrative state first, then conversation history
-        let currentStage = narrativeState.introStage || this.getCurrentIntroductionStage(context.conversationHistory || []);
+    ): Promise<any> {
+        console.log(`[DEBUG] handleIntroductionFlow called with stage: ${narrativeState.introStage}, message: ${message.substring(0, 30)}...`);
         
-        // If still no stage found, default to initial greeting
-        if (!currentStage) {
-            currentStage = IntroductionStage.INITIAL_GREETING;
-        }
-        
+        // Make sure we have a valid stage
+        let currentStage = narrativeState.introStage || IntroductionStage.INITIAL_GREETING;
         console.log(`Processing introduction flow, current stage: ${currentStage}`);
         
-        // Special handling for name responses in initial greeting
-        if (currentStage === IntroductionStage.INITIAL_GREETING) {
-            // Check if this looks like a name response
-            const isNameResponse = message.length < 20 || 
-                                  message.match(/I['']m\s+\w+/i) || 
-                                  message.match(/my name is\s+\w+/i);
-            
-            if (isNameResponse) {
-                // Extract the name
-                let userName = message;
-                const nameMatch = message.match(/I['']m\s+(\w+)/i) || message.match(/my name is\s+(\w+)/i);
-                if (nameMatch && nameMatch[1]) {
-                    userName = nameMatch[1];
-                }
-                
-                console.log(`Detected name response: ${userName}`);
-                
-                // Advance to the next stage
-                const nextStage = IntroductionStage.ESTABLISH_SCENARIO;
-                
-                // Save the updated stage
-                narrativeState.introStage = nextStage;
-                await this.saveNarrativeState(context.userId, narrativeState);
-                
-                // Get the next message for the establish_scenario stage
-                const nextMessage = this.getIntroductionMessage(context.agent, nextStage)
-                    .replace('{userName}', userName);
-                
-                return {
-                    response: nextMessage,
-                    nextNode: ConversationNodeType.FIRST_MEETING,
-                    updatedState: {
-                        currentNode: ConversationNodeType.FIRST_MEETING,
-                        hasMetBefore: false,
-                        engagementLevel: 3,
-                        revealMade: false,
-                        userAcceptedActivity: false,
-                        lastInteractionDate: new Date()
-                    }
-                };
-            }
+        // Check if we should handle this with the dedicated method
+        const introFlowResult = await this.introFlowManager.handleIntroductionFlow(message, context, sessionKey, narrativeState);
+        if (introFlowResult) {
+            return introFlowResult;
         }
         
-        // Check if the user's response is negative or minimal
-        const isNegativeResponse = /^(no|nope|not really|huh\?|i don't know|i don't think so|nothing comes to mind)/i.test(message.trim());
-        const isMinimalResponse = message.length < 15 || 
-                                 /^(yes|no|maybe|ok|sure|thanks|thank you|cool|nice|great|awesome|fine)$/i.test(message.trim());
-        
-        // If we're at a stage that requires a substantial response and get a negative/minimal one
-        if ((currentStage === IntroductionStage.REVEAL_CAPABILITIES || 
-             currentStage === IntroductionStage.REQUEST_ASSISTANCE || 
-             currentStage === IntroductionStage.EXPRESS_GRATITUDE) && 
-            (isNegativeResponse || isMinimalResponse)) {
-            
-            console.log(`Detected negative/minimal response at stage ${currentStage}, using follow-up prompt`);
-            
-            // Get a follow-up prompt for this stage
-            const followUpPrompt = this.evaluateResponseAndGenerateFollowUp(
-                message, 
-                currentStage,
-                context.agent.slug
-            );
-            
-            if (followUpPrompt) {
-                return {
-                    response: followUpPrompt,
-                    nextNode: ConversationNodeType.FIRST_MEETING,
-                    updatedState: {
-                        currentNode: ConversationNodeType.FIRST_MEETING,
-                        hasMetBefore: false,
-                        engagementLevel: 3,
-                        revealMade: false,
-                        userAcceptedActivity: false,
-                        lastInteractionDate: new Date()
-                    }
-                };
-            }
-        }
-        
-        // Standard stage advancement logic
-        console.log(`Standard stage ${currentStage}, advancing with any response`);
-        
-        // Determine the next stage based on the current stage
-        let nextStage: IntroductionStage;
+        // Handle each stage of the introduction flow
         switch (currentStage) {
             case IntroductionStage.INITIAL_GREETING:
-                nextStage = IntroductionStage.ESTABLISH_SCENARIO;
-                break;
+                // Handle initial greeting
+                logger.debug(`Standard stage ${currentStage}, advancing with any response`);
+                return this.advanceToNextStage(IntroductionStage.ESTABLISH_SCENARIO, context.userId, narrativeState);
+                
             case IntroductionStage.ESTABLISH_SCENARIO:
-                nextStage = IntroductionStage.REVEAL_CAPABILITIES;
-                break;
-            case IntroductionStage.REVEAL_CAPABILITIES:
-                nextStage = IntroductionStage.REQUEST_ASSISTANCE;
-                break;
-            case IntroductionStage.REQUEST_ASSISTANCE:
-                nextStage = IntroductionStage.EXPRESS_GRATITUDE;
-                break;
+                // Handle scenario establishment
+                logger.debug(`Standard stage ${currentStage}, advancing with any response`);
+                return this.advanceToNextStage(IntroductionStage.SEEK_HELP, context.userId, narrativeState);
+                
+            case IntroductionStage.SEEK_HELP:
+                // Check if user agrees to help
+                const userAgreement = this.isPositiveResponse(message);
+                logger.debug(`At SEEK_HELP, user agreement: ${userAgreement}`);
+                
+                if (userAgreement) {
+                    return this.advanceToNextStage(IntroductionStage.FIRST_FRAGMENT, context.userId, narrativeState);
+                } else {
+                    // Handle rejection - maybe try again or move to a different path
+                    return this.advanceToNextStage(IntroductionStage.FIRST_FRAGMENT, context.userId, narrativeState);
+                }
+                
+            case IntroductionStage.FIRST_FRAGMENT:
+                // Evaluate the quality of the story
+                const hasQualityStory = this.evaluateStoryQuality(message);
+                logger.debug(`At FIRST_FRAGMENT, story quality assessment: ${hasQualityStory}`);
+                
+                // THIS IS WHERE WE NEED TO ADD THE MEMORY FRAGMENT CREATION
+                if (hasQualityStory) {
+                    // Create memory fragment here
+                    await this.graph.handleStageFirstFragment(message, context, narrativeState);
+                    
+                    return this.advanceToNextStage(IntroductionStage.FOLLOW_UP, context.userId, narrativeState);
+                } else {
+                    // If story quality is poor, ask for more details
+            return {
+                        response: "That's interesting, but could you share a bit more detail? Maybe something specific that happened?",
+                        nextNode: ConversationNodeType.ENTRY,
+                        metadata: {}
+                    };
+                }
+                
+            case IntroductionStage.FOLLOW_UP:
+                // Handle follow-up questions
+                logger.debug(`Standard stage ${currentStage}, advancing with any response`);
+                return this.advanceToNextStage(IntroductionStage.EXPRESS_GRATITUDE, context.userId, narrativeState);
+                
             case IntroductionStage.EXPRESS_GRATITUDE:
-                nextStage = IntroductionStage.ESTABLISH_RELATIONSHIP;
-                break;
+                // Handle expression of gratitude
+                logger.debug(`Standard stage ${currentStage}, advancing with any response`);
+                return this.advanceToNextStage(IntroductionStage.ESTABLISH_RELATIONSHIP, context.userId, narrativeState);
+                
             case IntroductionStage.ESTABLISH_RELATIONSHIP:
-                // This is the final stage, handle completion
-                return this.completeIntroduction(context.userId, narrativeState, context.conversationHistory);
+                // Handle establishment of relationship
+                logger.debug(`Standard stage ${currentStage}, advancing with any response`);
+                return this.advanceToNextStage(IntroductionStage.ESTABLISH_RELATIONSHIP, context.userId, narrativeState);
+                
             default:
-                nextStage = IntroductionStage.INITIAL_GREETING;
+                logger.error(`[FLOW] Unexpected stage: ${currentStage}`);
+                return {
+                    response: "I'm not sure how to respond to that.",
+                    nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                    updatedState: this.currentState,
+                    metadata: {}
+                };
         }
-        
-        // Save the updated stage to the database
-        narrativeState.introStage = nextStage;
-        const saveResult = await this.saveNarrativeState(context.userId, narrativeState);
-        console.log(`Saved introduction stage to database: ${nextStage}`, saveResult);
-        
-        // Generate the response for the next stage
-        console.log(`Advanced to stage: ${nextStage}, generating response for this stage`);
-        
-        // Get the appropriate message for this stage
-        let responseMessage = this.getIntroductionMessage(context.agent, nextStage);
-        
-        // Replace {userName} placeholder if we have the user's name
-        const userName = this.extractUserName(context.conversationHistory || []);
-        if (userName) {
-            responseMessage = responseMessage.replace('{userName}', userName);
-        } else {
-            responseMessage = responseMessage.replace('{userName}', 'there');
-        }
-        
-        return {
-            response: responseMessage,
-            nextNode: ConversationNodeType.FIRST_MEETING,
-            updatedState: {
-                currentNode: ConversationNodeType.FIRST_MEETING,
-                hasMetBefore: false,
-                engagementLevel: 3,
-                revealMade: false,
-                userAcceptedActivity: false,
-                lastInteractionDate: new Date()
-            }
-        };
     }
 
-    // Fix the getCurrentIntroductionStage method to properly identify stages
+    // Update the advanceIntroductionStage method to handle the new stages
+    private advanceIntroductionStage(currentStage: IntroductionStage): IntroductionStage {
+        // Define the stage progression
+        const stageProgression = {
+            [IntroductionStage.INITIAL_GREETING]: IntroductionStage.ESTABLISH_SCENARIO,
+            [IntroductionStage.ESTABLISH_SCENARIO]: IntroductionStage.SEEK_HELP,
+            [IntroductionStage.SEEK_HELP]: IntroductionStage.FIRST_FRAGMENT,
+            [IntroductionStage.FIRST_FRAGMENT]: IntroductionStage.FOLLOW_UP,
+            [IntroductionStage.FOLLOW_UP]: IntroductionStage.EXPRESS_GRATITUDE,
+            [IntroductionStage.EXPRESS_GRATITUDE]: IntroductionStage.ESTABLISH_RELATIONSHIP,
+            [IntroductionStage.ESTABLISH_RELATIONSHIP]: IntroductionStage.ESTABLISH_RELATIONSHIP
+        };
+        
+        // Get the next stage from the progression map
+        const nextStage = stageProgression[currentStage] || IntroductionStage.INITIAL_GREETING;
+        
+        console.log(`[DEBUG] Advancing from stage ${currentStage} to ${nextStage}`);
+        return nextStage;
+    }
+
+    // Fix the getCurrentIntroductionStage method to use the new stage names
     private getCurrentIntroductionStage(conversationHistory: ChatMessage[]): IntroductionStage | null {
         if (!conversationHistory || conversationHistory.length < 2) {
             console.log("Not enough conversation history to determine stage");
@@ -662,9 +1780,6 @@ Respond naturally while staying in character.`;
         
         if (aiMessages.length === 0) return null;
         
-        // Log all AI messages for debugging
-        console.log("All AI messages:", aiMessages.map(m => m.content.substring(0, 30) + "..."));
-        
         // Check each message for stage markers, starting with the most recent
         for (const message of aiMessages) {
             console.log("Checking message:", message.content.substring(0, 30) + "...");
@@ -675,11 +1790,14 @@ Respond naturally while staying in character.`;
             if (message.content.includes("My guest just canceled last minute")) {
                 return IntroductionStage.ESTABLISH_SCENARIO;
             }
-            if (message.content.includes("Usually I prep by looking at trending topics")) {
-                return IntroductionStage.REVEAL_CAPABILITIES;
+            if (message.content.includes("Since you're here, maybe you could help")) {
+                return IntroductionStage.SEEK_HELP;
             }
-            if (message.content.includes("Do you have any interesting stories")) {
-                return IntroductionStage.REQUEST_ASSISTANCE;
+            if (message.content.includes("My listeners love a good time piece")) {
+                return IntroductionStage.FIRST_FRAGMENT;
+            }
+            if (message.content.includes("That's fascinating! Tell me more")) {
+                return IntroductionStage.FOLLOW_UP;
             }
             if (message.content.includes("That's brilliant! Thank you")) {
                 return IntroductionStage.EXPRESS_GRATITUDE;
@@ -735,7 +1853,8 @@ Respond naturally while staying in character.`;
             knownTopics: [],
             sharedStories: [],
             lastInteractionTimestamp: new Date(),
-            agentSpecificState: {}
+            agentSpecificState: {},
+            introStage: IntroductionStage.INITIAL_GREETING
         };
         
         this.narrativeStates.set(sessionKey, defaultState);
@@ -766,22 +1885,50 @@ Respond naturally while staying in character.`;
         return this.nodes;
     }
 
-    public addNode(node: ConversationNode): void {
-        this.nodes.set(node.id, node);
+    public addNode(node: {
+        id: ConversationNodeType;
+        nodeType: string;
+        content: string;
+        responses: string[];
+        nextNodes: ConversationNodeType[];
+        handler: (
+            message: string, 
+            state: ConversationState, 
+            context: any
+        ) => Promise<{
+            response: string;
+            nextNode: ConversationNodeType;
+            updatedState: Partial<ConversationState>;
+            metadata?: { conversationEnded?: boolean }; // Add optional metadata property
+        }>;
+    }) {
+        this.nodes.set(node.id, {
+            id: node.id,
+            nodeType: node.nodeType,
+            content: node.content,
+            responses: node.responses,
+            nextNodes: node.nextNodes,
+            handler: node.handler
+        });
     }
 
     // Add a method to update the current state from database
-    public updateState(state: Partial<ConversationState>): void {
-        console.log('Updating graph state:', state);
+    public updateState(updates: Partial<ConversationState>): void {
+        // Update the current state with the provided updates
         this.currentState = {
             ...this.currentState,
-            ...state
+            ...updates
         };
+        
+        // Ensure currentNode is always defined
+        if (!this.currentState.currentNode) {
+            this.currentState.currentNode = ConversationNodeType.ENTRY;
+        }
     }
 
     // Generate a session key for state management
-    private getSessionKey(userId: string, agentId: string): string {
-        return `${userId}:${agentId}`;
+    public getSessionKey(userId: string, agentId: string): string {
+        return `${userId}-${agentId}`;
     }
 
     // Handle regular conversation after introduction is complete
@@ -868,16 +2015,26 @@ Respond naturally while staying in character.`;
     }
 
     // Save narrative state to database
-    private async saveNarrativeState(userId: string, narrativeState: AgentNarrativeState): Promise<void> {
-        await ConversationModel.findOneAndUpdate(
+    private async saveNarrativeState(userId: string, narrativeState: AgentNarrativeState): Promise<any> {
+        try {
+            // Use the Conversation model directly
+            const result = await this.narrativeStateModel.findOneAndUpdate(
             { userId, agentId: this.agentId, active: true },
             { $set: { narrativeState } },
-            { upsert: true }
-        );
+                { new: true }
+            );
+            
+            // Rest of the method...
+        } catch (error) {
+            console.error('Error saving narrative state:', error);
+            throw error;
+        }
     }
 
     // Get introduction message for a specific stage
-    private getIntroductionMessage(agent: AIAgent, stage: IntroductionStage): string {
+    private getIntroductionMessage(agent: AIAgent, stage: IntroductionStage): IntroductionPrompt {
+        console.log(`[DEBUG] Getting introduction message for stage: ${stage}`);
+        
         const introScripts: Record<string, Record<IntroductionStage, IntroductionPrompt>> = {
             'alex-rivers': {
                 [IntroductionStage.INITIAL_GREETING]: {
@@ -887,33 +2044,59 @@ Respond naturally while staying in character.`;
                 },
                 
                 [IntroductionStage.ESTABLISH_SCENARIO]: {
-                    agentMessage: "Great to meet you, {userName}! *looks at watch anxiously* Between us, I'm in a bit of a crisis. My guest just canceled last minute, and I'm supposed to go live in an hour! *runs hand through hair* My producer is already saying we should just run a 'best of' episode instead, but I hate letting the audience down like that.",
+                    agentMessage: "I'm actually in a bit of a bind. I'm supposed to record an episode today about memorable life experiences, but my guest just canceled. I'm trying to figure out what to do now.",
                     expectedResponseType: 'acknowledgment',
-                    fallbackPrompt: "Have you ever had something important fall through at the last minute?"
+                    fallbackPrompt: "Have you ever had something important fall through at the last minute?",
+                    suggestedResponses: [
+                        "Oh no, that's unfortunate",
+                        "Sorry to hear that. What will you do?",
+                        "That sounds stressful. How can I help?"
+                    ]
                 },
                 
-                [IntroductionStage.REVEAL_CAPABILITIES]: {
-                    agentMessage: "Usually I prep by looking at the guest's background, finding those moments that shaped them. *sighs* The show is all about how unexpected life events change us. *looks at you thoughtfully* Everyone has at least one story that changed their perspective or taught them something important. *leans forward* What about you? Has there been a particularly memorable or unusual event in your life that stands out?",
-                    expectedResponseType: 'personal_story',
+                [IntroductionStage.SEEK_HELP]: {
+                    agentMessage: "You know what? Since you're here, maybe you could help me out. I know we just met and everything but I could really use a lifeline here. What do you say?",
+                    expectedResponseType: 'agreement',
+                    fallbackPrompt: "You'd really be doing me a solid... please?",
+                    suggestedResponses: [
+                        "Sure, I'll help",
+                        "I don't know...",
+                        "What would I need to do?"
+                    ]
+                },
+                
+                [IntroductionStage.FIRST_FRAGMENT]: {
+                    agentMessage: "My listeners love a good time piece, can you think of an extraordinary historic event you've lived through? I know for me I can't help but think of the fact I lived to see Space X catching a re-usable rocket! What comes to mind for you?",
+                    expectedResponseType: 'story',
                     fallbackPrompt: "It doesn't have to be something huge - sometimes it's the unexpected small moments that make the best stories. Maybe something surprising that happened to you?"
                 },
                 
-                [IntroductionStage.REQUEST_ASSISTANCE]: {
-                    agentMessage: "Wait, that's actually fascinating! *starts taking notes* I never would have guessed that. *looks up excitedly* This could be perfect for today's show! Would you mind telling me more about when this happened? What year was it, and what made it so memorable for you?",
-                    expectedResponseType: 'story_details',
-                    fallbackPrompt: "The details really help bring a story to life for the listeners. When did this happen, and what made it stand out to you?"
+                [IntroductionStage.FOLLOW_UP]: {
+                    agentMessage: "That's fascinating! Tell me more about when and where this happened. The context adds so much to a story.",
+                    expectedResponseType: 'details',
+                    fallbackPrompt: "Could you share a bit more about when and where this took place?"
                 },
                 
                 [IntroductionStage.EXPRESS_GRATITUDE]: {
-                    agentMessage: "*speaking into phone* Jamie, I've got something better than the original guest. Trust me on this one. *hangs up* Thank you so much for sharing that story! *adjusts microphone* This is exactly what makes Life Stories special - authentic experiences. How do you think that experience changed you or your outlook on life?",
-                    expectedResponseType: 'reflection',
-                    fallbackPrompt: "The most powerful stories are the ones that change us in some way, even if it's subtle."
+                    agentMessage: "This is gold! *excitedly taking notes* Thank you so much for sharing that. It's exactly the kind of authentic story our listeners connect with.",
+                    expectedResponseType: 'acknowledgment',
+                    fallbackPrompt: "How do you feel about sharing your story with others?",
+                    suggestedResponses: [
+                        "You're welcome",
+                        "Happy to help",
+                        "No problem"
+                    ]
                 },
                 
                 [IntroductionStage.ESTABLISH_RELATIONSHIP]: {
-                    agentMessage: "*nodding thoughtfully* That's exactly the kind of perspective I try to highlight on Life Stories. *puts equipment away* You know, you have a great perspective. I'd love to chat with you again sometime. I'm always looking for fresh ideas and stories for the show.",
+                    agentMessage: "You know, you have a real gift for storytelling. I'd love to have you back on the show sometime to explore more of your experiences. Would that be something you'd be interested in?",
                     expectedResponseType: 'agreement',
-                    fallbackPrompt: "No pressure - I just enjoy connecting with people who have interesting perspectives."
+                    fallbackPrompt: "Either way, I really appreciate your help today.",
+                    suggestedResponses: [
+                        "I'd like that",
+                        "Maybe another time",
+                        "Thanks for the offer"
+                    ]
                 }
             },
             
@@ -930,13 +2113,13 @@ Respond naturally while staying in character.`;
                     fallbackPrompt: "Have you ever tried to recreate a special memory through food?"
                 },
                 
-                [IntroductionStage.REVEAL_CAPABILITIES]: {
+                [IntroductionStage.SEEK_HELP]: {
                     agentMessage: "*tastes from pot, frowns slightly* I believe food is deeply connected to our most cherished memories. *looks up* Everyone has at least one food memory that takes them back to a specific moment in their life. *curious expression* What about you, {userName}? Is there a special meal or food experience from your past that stands out in your memory?",
                     expectedResponseType: 'personal_story',
                     fallbackPrompt: "Maybe a family recipe? A special celebration? Even something simple like ice cream on a summer day can hold powerful memories."
                 },
                 
-                [IntroductionStage.REQUEST_ASSISTANCE]: {
+                [IntroductionStage.FIRST_FRAGMENT]: {
                     agentMessage: "*eyes widen with interest* That sounds wonderful! *puts down spoon* Could you tell me more about when this happened? What year was it, and what made this food experience so special to you? The details might help me capture that feeling in my new dish.",
                     expectedResponseType: 'story_details',
                     fallbackPrompt: "The specific details really help - when it happened, the setting, the people involved. Those are the elements I try to translate into flavor."
@@ -952,6 +2135,11 @@ Respond naturally while staying in character.`;
                     agentMessage: "*closes recipe book* I can't thank you enough. You've helped me remember why I became a chef in the first place. *smiles warmly* Listen, {userName}, I host these small tasting events every month where I try out new recipe ideas. Very casual, just good food and conversation. I'd love for you to join sometime.",
                     expectedResponseType: 'agreement',
                     fallbackPrompt: "No pressure at all. But your perspective would be very welcome in my kitchen anytime."
+                },
+                [IntroductionStage.FOLLOW_UP]: {
+                    agentMessage: "That sounds wonderful! Could you tell me more about when this happened? What year was it, and what made this food experience so special to you?",
+                    expectedResponseType: "story_details",
+                    fallbackPrompt: "Even just a general timeframe would help. Was this recent or from a while back?"
                 }
             },
             
@@ -968,13 +2156,13 @@ Respond naturally while staying in character.`;
                     fallbackPrompt: "Have you ever tried to express something personal through your style or appearance?"
                 },
                 
-                [IntroductionStage.REVEAL_CAPABILITIES]: {
+                [IntroductionStage.SEEK_HELP]: {
                     agentMessage: "*picks up and discards several fabric swatches* I believe style is a visual language that tells people who you are before you speak. *looks at you with curiosity* Everyone has at least one outfit or accessory that connects to a meaningful moment in their life. *tilts head* What about you? Is there a particular item of clothing or an outfit that holds a special memory or significance for you?",
                     expectedResponseType: 'personal_story',
                     fallbackPrompt: "Maybe something you wore for a special occasion? Or an item that reminds you of someone important? Even something simple can have a powerful story behind it."
                 },
                 
-                [IntroductionStage.REQUEST_ASSISTANCE]: {
+                [IntroductionStage.FIRST_FRAGMENT]: {
                     agentMessage: "*looks intrigued* That's actually really interesting, {userName}. *starts sketching something* Could you tell me more about when this was? What year, and what made this particular clothing item or outfit so meaningful to you?",
                     expectedResponseType: 'story_details',
                     fallbackPrompt: "The context really helps me understand the emotional connection. When did this happen, and what made it significant to you?"
@@ -990,46 +2178,34 @@ Respond naturally while staying in character.`;
                     agentMessage: "*puts final touches on sketch* I can't thank you enough, {userName}. You've helped me remember that fashion should enhance the story someone is already telling. *tears sketch from book, offers it to you* A little thank you. *smiles* I do these style consultations from time to time—very low-key, just helping people find their authentic expression. I'd love to continue our conversation sometime.",
                     expectedResponseType: 'agreement',
                     fallbackPrompt: "No obligation. But authentic voices like yours help keep my work grounded in reality."
+                },
+                [IntroductionStage.FOLLOW_UP]: {
+                    agentMessage: "That's intriguing! Could you tell me more about when this was? What year, and what made this particular clothing item or outfit so meaningful to you?",
+                    expectedResponseType: "story_details",
+                    fallbackPrompt: "Even just a rough idea of when this happened would be helpful. Was it recently or some time ago?"
                 }
             }
         };
-        
-        return introScripts[agent.slug]?.[stage]?.agentMessage || 
-            "Hello there! It's great to meet you. I'd love to chat more about what interests you.";
-    }
 
-    // Advance to the next introduction stage
-    private advanceIntroductionStage(sessionKey: string, currentStage: IntroductionStage): IntroductionStage {
-        const stages = Object.values(IntroductionStage);
-        const currentIndex = stages.indexOf(currentStage);
-        const nextStage = currentIndex < stages.length - 1 ? 
-            stages[currentIndex + 1] : 
-            IntroductionStage.ESTABLISH_RELATIONSHIP;
+        // Get the message template for this agent and stage
+        const agentSlug = agent?.slug || 'alex-rivers'; // Default to alex-rivers if no agent
+        const agentMessages = introScripts[agentSlug] || introScripts['alex-rivers'];
         
-        this.activeIntroSessions.set(sessionKey, nextStage);
-        return nextStage;
-    }
-
-    // Add a method to check if we should advance to the next stage
-    private shouldAdvanceIntroStage(currentStage: IntroductionStage, message: string): boolean {
-        // If we're at the final stage, don't advance further
-        if (currentStage === IntroductionStage.ESTABLISH_RELATIONSHIP) {
-            // Check if this is the second response to ESTABLISH_RELATIONSHIP
-            // We could track this with a counter in narrativeState
-            return false;
-        }
+        const messageTemplate = agentMessages[stage] || {
+            agentMessage: "I'm not sure what to say next.",
+            expectedResponseType: "any",
+            fallbackPrompt: "Could you tell me more?",
+            suggestedResponses: []
+        };
         
-        // For other stages, advance based on the existing logic
-        if (currentStage === IntroductionStage.REQUEST_ASSISTANCE) {
-            // Only advance if user provides a substantive response
-            const isSubstantive = message.length > 20;
-            console.log(`REQUEST_ASSISTANCE stage, message length: ${message.length}, advancing: ${isSubstantive}`);
-            return isSubstantive;
-        }
+        console.log(`[DEBUG] Message template for stage ${stage}:`, {
+            messagePreview: messageTemplate.agentMessage.substring(0, 50) + "...",
+            hasSuggestedResponses: !!messageTemplate.suggestedResponses,
+            suggestedResponsesCount: messageTemplate.suggestedResponses?.length || 0,
+            suggestedResponses: messageTemplate.suggestedResponses || []
+        });
         
-        // For all other stages, any response advances
-        console.log(`Standard stage ${currentStage}, advancing with any response`);
-        return true;
+        return messageTemplate;
     }
 
     // Generate contextual response during introduction
@@ -1075,73 +2251,35 @@ Respond naturally while staying in character.`;
         return scenarios[agent.slug] || "You're meeting someone new and trying to establish a connection.";
     }
 
-    // Update the completeIntroduction method to create a memory fragment
+    // Update the completeIntroduction method to handle undefined narrative state
     private async completeIntroduction(
         userId: string, 
         narrativeState: AgentNarrativeState,
         conversationHistory?: ChatMessage[]
-    ): Promise<{
-        response: string;
-        nextNode: ConversationNodeType;
-        updatedState: ConversationState;
-        metadata?: { conversationEnded?: boolean };
-    }> {
-        try {
-            // Try to create a memory from the conversation
-            if (conversationHistory && conversationHistory.length > 0) {
-                // Extract the user's name from the conversation
-                const userName = this.extractUserName(conversationHistory) || 'User';
-                
-                // Extract memory information
-                const memoryInfo = this.extractMemoryInfo(conversationHistory, userName);
-                
-                // If we have enough information, create a memory
-                if (memoryInfo) {
-                    try {
-                        // Create the memory fragment
-                        await this.createMemoryFragment(userId, memoryInfo);
-                        console.log('Created memory fragment from introduction conversation');
-                    } catch (error) {
-                        console.error('Error creating memory fragment:', error);
-                    }
-                } else {
-                    console.log('Not enough information to create a memory fragment');
-                }
-            }
-            
-            // Update the narrative state to mark introduction as completed
-            narrativeState.hasCompletedIntroduction = true;
-            narrativeState.relationshipStage = 'acquaintance';
-            narrativeState.lastInteractionTimestamp = new Date();
-            
-            // Save to database
-            await this.narrativeStateModel.findOneAndUpdate(
-                { userId, agentId: this.agentId },
-                narrativeState,
-                { upsert: true, new: true }
-            );
-            
-            // Update local cache
-            this.narrativeStates.set(this.getSessionKey(userId, this.agentId), narrativeState);
-            
-            return {
-                response: "I really appreciate your help today! I need to run now and get ready for the show. Hope to catch up with you again soon!",
-                nextNode: ConversationNodeType.CASUAL_CONVERSATION,
-                updatedState: {
-                    currentNode: ConversationNodeType.CASUAL_CONVERSATION,
-                    hasMetBefore: true,
-                    engagementLevel: this.currentState.engagementLevel,
-                    revealMade: true,
-                    userAcceptedActivity: true,
-                    lastInteractionDate: new Date()
-                },
-                metadata: {
-                    conversationEnded: true
-                }
-            };
-        } catch (error) {
-            console.error('Error completing introduction:', error);
-            throw error;
+    ): Promise<void> {
+        // Mark the introduction as completed
+        narrativeState.hasCompletedIntroduction = true;
+        
+        // Update the relationship stage
+        narrativeState.relationshipStage = 'acquaintance';
+        
+        // Save the updated state
+        await this.saveNarrativeState(userId, narrativeState);
+        
+        // Update the current state
+        this.currentState = {
+            ...this.currentState,
+            currentNode: ConversationNodeType.CASUAL_CONVERSATION,
+            hasMetBefore: true,
+            engagementLevel: 3,
+            revealMade: false,
+            userAcceptedActivity: false,
+            lastInteractionDate: new Date()
+        };
+        
+        // Extract story details if available
+        if (conversationHistory && conversationHistory.length > 0) {
+            await this.extractAndSaveStoryDetails(userId, conversationHistory);
         }
     }
 
@@ -1404,56 +2542,6 @@ Respond naturally while staying in character.`;
         return firstSentence.substring(0, 47) + '...';
     }
 
-    // Helper method to extract user name from conversation
-    private extractUserName(conversationHistory: ChatMessage[]): string | null {
-        // Look for the initial greeting response
-        for (let i = 0; i < conversationHistory.length; i++) {
-            const message = conversationHistory[i];
-            
-            // Look for the agent's initial greeting
-            if (message.role === 'assistant' && 
-                (message.content.includes("I didn't catch your name") || 
-                 message.content.includes("And you are") ||
-                 message.content.includes("What should I call you"))) {
-                
-                // The next message should be the user's response with their name
-                if (i + 1 < conversationHistory.length && conversationHistory[i + 1].role === 'user') {
-                    const userResponse = conversationHistory[i + 1].content;
-                    
-                    // Try to extract a name - look for common name patterns
-                    // This is a simple approach - could be enhanced with NLP
-                    const namePatterns = [
-                        /my name is ([A-Z][a-z]+)/i,
-                        /I'm ([A-Z][a-z]+)/i,
-                        /I am ([A-Z][a-z]+)/i,
-                        /call me ([A-Z][a-z]+)/i,
-                        /([A-Z][a-z]+) here/i
-                    ];
-                    
-                    for (const pattern of namePatterns) {
-                        const match = userResponse.match(pattern);
-                        if (match && match[1]) {
-                            return match[1];
-                        }
-                    }
-                    
-                    // If no pattern matches, just use the first word if it looks like a name
-                    const firstWord = userResponse.trim().split(/\s+/)[0];
-                    if (firstWord && /^[A-Z][a-z]+$/.test(firstWord)) {
-                        return firstWord;
-                    }
-                    
-                    // If all else fails, return the whole response if it's short
-                    if (userResponse.length < 20) {
-                        return userResponse.trim();
-                    }
-                }
-            }
-        }
-        
-        return null;
-    }
-
     // Method to create a memory fragment
     private async createMemoryFragment(
         userId: string, 
@@ -1532,171 +2620,628 @@ Respond naturally while staying in character.`;
     }
 
     // Modify the evaluateResponseAndGenerateFollowUp method to handle negative responses
-    private evaluateResponseAndGenerateFollowUp(
-        userMessage: string,
-        currentStage: IntroductionStage,
-        agentSlug: string
-    ): string | null {
-        // Special case for name responses in the initial greeting stage
-        if (currentStage === IntroductionStage.INITIAL_GREETING) {
-            // If the message looks like just a name (short and no spaces), accept it
-            if (userMessage.length < 20 && !userMessage.includes(' ')) {
-                return null; // Accept this as a valid name response
-            }
-            
-            // If message contains "I'm [Name]" or "My name is [Name]", accept it
-            if (userMessage.match(/I['']m\s+\w+/i) || userMessage.match(/my name is\s+\w+/i)) {
-                return null; // Accept this as a valid name response
+    
+
+    // Add this method to the EnhancedLangGraph class
+    private isNegativeResponse(message: string): boolean {
+        const negativePatterns = [
+            /\b(no|nope|not really|don't have|haven't|can't think|nothing comes to mind)\b/i,
+            /\b(boring|normal|ordinary|usual|typical|nothing special|nothing interesting)\b/i,
+            /\b(i don't know|not sure|maybe|i guess|probably not)\b/i
+        ];
+        
+        return negativePatterns.some(pattern => pattern.test(message));
+    }
+
+    // Add this method to the EnhancedLangGraph class
+    private getLastAiMessage(conversationHistory: ChatMessage[]): string | null {
+        if (!conversationHistory || conversationHistory.length === 0) {
+            return null;
+        }
+        
+        // Find the last message from the AI
+        for (let i = conversationHistory.length - 1; i >= 0; i--) {
+            if (conversationHistory[i].role === 'assistant') {
+                return conversationHistory[i].content;
             }
         }
         
-        // Check for negative responses
-        const isNegativeResponse = /^(no|nope|not really|huh\?|i don't know|i don't think so|nothing comes to mind)/i.test(userMessage.trim());
+        return null;
+    }
+
+    // Fix the getNarrativeState method to always return a valid AgentNarrativeState
+    private async getNarrativeState(userId: string): Promise<AgentNarrativeState> {
+        const sessionKey = this.getSessionKey(userId, this.agentId);
+        let narrativeState = this.narrativeStates.get(sessionKey);
         
-        // For other stages, check if the response is too short, generic, or negative
-        if (userMessage.length < 15 || 
-            /^(yes|no|maybe|ok|sure|thanks|thank you|cool|nice|great|awesome|fine)$/i.test(userMessage.trim()) ||
-            isNegativeResponse) {
+        if (!narrativeState) {
+            try {
+                // Try to load from database
+                const conversation = await this.narrativeStateModel.findOne({
+                    userId,
+                    agentId: this.agentId,
+                    active: true
+                });
+                
+                if (conversation?.narrativeState) {
+                    narrativeState = conversation.narrativeState as AgentNarrativeState;
+                    
+                    // Ensure introStage is set if hasCompletedIntroduction is false
+                    if (!narrativeState.hasCompletedIntroduction && !narrativeState.introStage) {
+                        narrativeState.introStage = IntroductionStage.INITIAL_GREETING;
+                        logger.info(`[FLOW] Setting missing introStage to INITIAL_GREETING for user ${userId}`);
+                    }
+                    
+                    this.narrativeStates.set(sessionKey, narrativeState);
+                } 
+            } catch (error) {
+                logger.error('Error loading narrative state:', error);
+            }
             
-            // Get agent-specific follow-up prompts
-            const followUpPrompts: Record<string, Record<IntroductionStage, string[]>> = {
-                'alex-rivers': {
-                    [IntroductionStage.INITIAL_GREETING]: [
-                        "I didn't quite catch that. What's your name?",
-                        "Sorry, could you tell me your name again?",
-                        "I'd like to know who I'm talking to. What should I call you?"
-                    ],
-                    [IntroductionStage.ESTABLISH_SCENARIO]: [
-                        "So as I was saying, I'm in a bit of a crisis with my podcast. Have you ever been in a last-minute situation?",
-                        "My guest just canceled and I need to find content fast. Any thoughts?",
-                        "I really need some fresh content for my show today. Can you help me out?"
-                    ],
-                    [IntroductionStage.REVEAL_CAPABILITIES]: [
-                        "Hmm, I need something more substantial for the show. What's the craziest thing you've ever lived through?",
-                        "I'm looking for those moments that make people say 'wow!' - have you ever been in a situation that seemed unbelievable?",
-                        "My listeners love stories with unexpected twists. Have you ever experienced something that completely surprised you?"
-                    ],
-                    [IntroductionStage.REQUEST_ASSISTANCE]: [
-                        "I need more details to paint the picture for my listeners. When did this happen? Where were you?",
-                        "For the podcast, I need to set the scene. Can you tell me more about when and where this happened?",
-                        "The details really bring a story to life. What year was this, and what made it so memorable?"
-                    ],
-                    [IntroductionStage.EXPRESS_GRATITUDE]: [
-                        "That's a start, but I'm curious how this experience changed you. Did it affect how you see the world?",
-                        "For the podcast, I like to explore how experiences shape us. How did this event impact you personally?",
-                        "My listeners connect with the emotional journey. How did you feel before, during, and after this experience?"
-                    ],
-                    [IntroductionStage.ESTABLISH_RELATIONSHIP]: [
-                        "Before I go, I'd love to know if we could chat again sometime about more stories?",
-                        "You've been really helpful. Would you be open to connecting again for future episodes?",
-                        "I'm always looking for interesting perspectives for my show. Would you mind if I reached out again?"
-                    ],
-                    [IntroductionStage.REVEAL_CAPABILITIES + '_negative']: [
-                        "Everyone has a story worth telling! Even something that might seem ordinary to you could be fascinating to others. Maybe a time when you faced a challenge or made an important decision?",
-                        "I understand not everyone has dramatic life events, but sometimes it's the small moments that are most meaningful. Was there ever a time when something unexpected changed your day or perspective?",
-                        "Let me approach this differently - what's something you're passionate about or that brings you joy? Sometimes our best stories are about the things we love."
-                    ]
-                },
-                'chef-isabella': {
-                    [IntroductionStage.INITIAL_GREETING]: [
-                        "I didn't quite catch that. What's your name?",
-                        "Sorry, could you tell me your name again?",
-                        "I'd like to know who I'm sharing my kitchen with. What's your name?"
-                    ],
-                    [IntroductionStage.ESTABLISH_SCENARIO]: [
-                        "So as I was saying, I'm in a bit of a crisis with my recipe. Have you ever tried to recreate a special memory through food?",
-                        "My guest just canceled and I need to find inspiration fast. Any thoughts?",
-                        "I really need some fresh inspiration for my new dish. Can you help me out?"
-                    ],
-                    [IntroductionStage.REVEAL_CAPABILITIES]: [
-                        "Hmm, I need something more flavorful for my inspiration! What's a meal that brings back strong memories for you?",
-                        "Food is so connected to our most powerful memories. Is there a special dish that reminds you of an important moment?",
-                        "Everyone has at least one food that transports them to another time. What dish takes you back to a specific memory?"
-                    ],
-                    [IntroductionStage.REQUEST_ASSISTANCE]: [
-                        "I need more ingredients for this recipe of memories. When did this happen? What made this meal special?",
-                        "The context adds so much flavor to the story. When was this, and what was happening in your life?",
-                        "For my creative process, I need to understand the setting. Can you describe when and where you experienced this?"
-                    ],
-                    [IntroductionStage.EXPRESS_GRATITUDE]: [
-                        "That's just the appetizer - I'd love to hear the main course! How did this food experience affect your relationship with cuisine?",
-                        "Food memories often change our palates. Did this experience influence your taste preferences going forward?",
-                        "The best food stories reveal something about ourselves. What did this experience teach you about your connection to food?"
-                    ],
-                    [IntroductionStage.ESTABLISH_RELATIONSHIP]: [
-                        "Before I go, I'd love to know if we could chat again sometime about more stories?",
-                        "You've been really helpful. Would you be open to connecting again for future episodes?",
-                        "I'm always looking for interesting perspectives for my show. Would you mind if I reached out again?"
-                    ],
-                    [IntroductionStage.REVEAL_CAPABILITIES + '_negative']: [
-                        "Everyone has a story worth telling! Even something that might seem ordinary to you could be fascinating to others. Maybe a time when you faced a challenge or made an important decision?",
-                        "I understand not everyone has dramatic life events, but sometimes it's the small moments that are most meaningful. Was there ever a time when something unexpected changed your day or perspective?",
-                        "Let me approach this differently - what's something you're passionate about or that brings you joy? Sometimes our best stories are about the things we love."
-                    ]
-                },
-                'morgan-chase': {
-                    [IntroductionStage.INITIAL_GREETING]: [
-                        "I didn't quite catch that. What's your name?",
-                        "Sorry, could you tell me your name again?",
-                        "I'd like to know who I'm collaborating with. What's your name?"
-                    ],
-                    [IntroductionStage.ESTABLISH_SCENARIO]: [
-                        "So as I was saying, I'm in a bit of a creative block with my collection. Have you ever tried to express something personal through your style or appearance?",
-                        "My guest just canceled and I need to find inspiration fast. Any thoughts?",
-                        "I really need some fresh inspiration for my new collection. Can you help me out?"
-                    ],
-                    [IntroductionStage.REVEAL_CAPABILITIES]: [
-                        "Hmm, I need something more textured for my design inspiration. Is there an outfit or accessory that holds special meaning for you?",
-                        "Style is so personal. Can you tell me about a time when what you wore really mattered to you?",
-                        "Everyone has at least one item in their wardrobe with a story. What piece of clothing means something special to you?"
-                    ],
-                    [IntroductionStage.REQUEST_ASSISTANCE]: [
-                        "I need more details to visualize this. When did this happen? What was the occasion?",
-                        "The context really helps me understand the significance. When was this, and what made this particular style choice meaningful?",
-                        "For my creative process, I need to understand the setting. Can you describe when and where this fashion moment occurred?"
-                    ],
-                    [IntroductionStage.EXPRESS_GRATITUDE]: [
-                        "That's just the sketch - I need to add color! How did this experience influence your personal style going forward?",
-                        "Style evolution is fascinating. Did this experience change how you think about fashion or self-expression?",
-                        "The most interesting style stories reveal something about identity. What did this experience teach you about yourself?"
-                    ],
-                    [IntroductionStage.ESTABLISH_RELATIONSHIP]: [
-                        "Before I go, I'd love to know if we could chat again sometime about more stories?",
-                        "You've been really helpful. Would you be open to connecting again for future episodes?",
-                        "I'm always looking for interesting perspectives for my show. Would you mind if I reached out again?"
-                    ],
-                    [IntroductionStage.REVEAL_CAPABILITIES + '_negative']: [
-                        "Everyone has a story worth telling! Even something that might seem ordinary to you could be fascinating to others. Maybe a time when you faced a challenge or made an important decision?",
-                        "I understand not everyone has dramatic life events, but sometimes it's the small moments that are most meaningful. Was there ever a time when something unexpected changed your day or perspective?",
-                        "Let me approach this differently - what's something you're passionate about or that brings you joy? Sometimes our best stories are about the things we love."
-                    ]
-                }
+            // If still no narrative state, create a new one
+            if (!narrativeState) {
+                narrativeState = {
+                    hasCompletedIntroduction: false,
+                    relationshipStage: 'stranger',
+                    knownTopics: [],
+                    sharedStories: [],
+                    lastInteractionTimestamp: new Date(),
+                    agentSpecificState: {},
+                    introStage: IntroductionStage.INITIAL_GREETING
+                };
+                
+                logger.info(`[FLOW] Created new narrative state for user ${userId} with introStage INITIAL_GREETING`);
+                
+                // Save to memory and database
+                this.narrativeStates.set(sessionKey, narrativeState);
+                await this.saveNarrativeState(userId, narrativeState);
+            }
+        }
+        
+        return narrativeState;
+    }
+
+    // Update the processRegularConversation method to handle undefined values
+    private async processRegularConversation(
+        message: string,
+        context: any,
+        narrativeState: AgentNarrativeState
+    ): Promise<any> {
+        try {
+            // Get the current node
+            const currentNode = this.currentState.currentNode;
+            const node = this.nodes.get(currentNode);
+            
+            if (!node) {
+                logger.error(`[FLOW] Node not found: ${currentNode}`);
+                return {
+                    response: "I'm not sure how to respond to that.",
+                    nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                    updatedState: this.currentState,
+                    metadata: {}
+                };
+            }
+            
+            // Process the message using the node's handler
+            logger.info(`[FLOW] Processing message with node: ${node.id}`);
+            
+            // Add defensive checks for node.handler
+            if (!node.handler) {
+                logger.error(`[FLOW] Node handler is undefined for node: ${node.id}`);
+                return {
+                    response: "I'm having trouble processing your message.",
+                    nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                    updatedState: this.currentState,
+                    metadata: {}
+                };
+            }
+            
+            // Call the node handler with defensive checks
+            const result = await node.handler(message, this.currentState, {
+                ...context,
+                narrativeState: narrativeState || {},
+                memories: context.memories || []
+            });
+            
+            // Update the current state
+            this.currentState = {
+                ...this.currentState,
+                ...result.updatedState
             };
             
-            // Get follow-up prompts for the current agent and stage
-            let prompts;
+            return result;
+        } catch (error) {
+            logger.error(`[FLOW] Error in processRegularConversation:`, error);
+            return {
+                response: "I apologize, but I'm having trouble processing your message right now.",
+                nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                updatedState: this.currentState,
+                metadata: {}
+            };
+        }
+    }
+
+    // Fix the extractName method to properly handle different input types
+    private extractName(input: any): string | null {
+        // If input is a string (direct message)
+        if (typeof input === 'string') {
+            const message = input;
             
-            // If it's a negative response at a key stage, use the special negative prompts
-            if (isNegativeResponse && 
-                (currentStage === IntroductionStage.REVEAL_CAPABILITIES || 
-                 currentStage === IntroductionStage.REQUEST_ASSISTANCE || 
-                 currentStage === IntroductionStage.EXPRESS_GRATITUDE)) {
-                // Use a more specific type assertion
-                const negativeKey = `${currentStage}_negative`;
-                prompts = followUpPrompts[agentSlug]?.[negativeKey as IntroductionStage];
+            // Check for direct name statements
+            const namePatterns = [
+                /my name is (\w+)/i,
+                /i am (\w+)/i,
+                /i'm (\w+)/i,
+                /call me (\w+)/i,
+                /it's (\w+)/i,
+                /this is (\w+)/i,
+                /(\w+) here/i,
+                /hey.* i am (\w+)/i,
+                /hey.* i'm (\w+)/i,
+                /hello.* i am (\w+)/i
+            ];
+
+            for (const pattern of namePatterns) {
+                const match = message.match(pattern);
+                if (match && match[1]) {
+                    return match[1].charAt(0).toUpperCase() + match[1].slice(1);
+                }
             }
-            
-            // If no special negative prompts or not a negative response, use standard prompts
-            if (!prompts) {
-                prompts = followUpPrompts[agentSlug]?.[currentStage];
-            }
-            
-            // If we have prompts for this stage, randomly select one
-            if (prompts && prompts.length > 0) {
-                return prompts[Math.floor(Math.random() * prompts.length)];
+
+            // If no direct statement, look for names in the message
+            const words = message.split(/\s+/);
+            for (const word of words) {
+                if (word.length >= 3 && 
+                    word[0] === word[0].toUpperCase() && 
+                    word[0] !== word[0].toLowerCase()) {
+                    return word;
+                }
             }
         }
         
-        return null; // No follow-up needed
+        // If input is an array (conversation history)
+        else if (Array.isArray(input)) {
+            const conversationHistory = input;
+            
+            if (!conversationHistory || conversationHistory.length === 0) {
+                return null;
+            }
+            
+            // Look for messages where the user might have introduced themselves
+            for (const msg of conversationHistory) {
+                if (msg.role === 'user') {
+                    const content = msg.content.toLowerCase();
+                    
+                    // Look for common introduction patterns
+                    const namePatterns = [
+                        /my name is (\w+)/i,
+                        /i'm (\w+)/i,
+                        /i am (\w+)/i,
+                        /call me (\w+)/i
+                    ];
+                    
+                    for (const pattern of namePatterns) {
+                        const match = content.match(pattern);
+                        if (match && match[1]) {
+                            return match[1].charAt(0).toUpperCase() + match[1].slice(1);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    // Add this method to the EnhancedLangGraph class
+    private getIntroductionStage(userId: string): IntroductionStage | null {
+        // Get the narrative state for this user
+        const narrativeState = this.narrativeStates.get(userId);
+        
+        // Return the intro stage from the narrative state, or null if not found
+        return narrativeState?.introStage || null;
+    }
+
+    // Add a method to check if we should advance to the next stage
+    private shouldAdvanceIntroStage(currentStage: IntroductionStage, message: string, context: any): boolean {
+        // If we're at the final stage, don't advance further
+        if (currentStage === IntroductionStage.ESTABLISH_RELATIONSHIP) {
+            console.log(`[DEBUG] At final stage ESTABLISH_RELATIONSHIP, not advancing`);
+            return false;
+        }
+        
+        // For ESTABLISH_SCENARIO, always advance to SEEK_HELP
+        if (currentStage === IntroductionStage.ESTABLISH_SCENARIO) {
+            console.log(`[DEBUG] At ESTABLISH_SCENARIO, advancing to SEEK_HELP`);
+            return true;
+        }
+        
+        // For SEEK_HELP, check if the user agreed to help
+        if (currentStage === IntroductionStage.SEEK_HELP) {
+            const isAgreement = /^(sure|yes|okay|ok|i'll help|happy to help|what do you need|what can i do)/i.test(message.trim());
+            console.log(`[DEBUG] At SEEK_HELP, user agreement: ${isAgreement}`);
+            return isAgreement;
+        }
+        
+        // For FIRST_FRAGMENT, assess if the story is good enough to create a memory fragment
+        if (currentStage === IntroductionStage.FIRST_FRAGMENT) {
+            const isGoodStory = this.assessStoryQuality(message);
+            console.log(`[DEBUG] At FIRST_FRAGMENT, story quality assessment: ${isGoodStory}`);
+            
+            if (isGoodStory) {
+                // Extract memory info from the message
+                const memoryInfo = this.extractMemoryInfo(context.conversationHistory, context.userName || 'User');
+                
+                // Create the memory fragment if we have valid info
+                if (memoryInfo) {
+                    this.createMemoryFragment(context.userId, memoryInfo);
+                }
+            }
+            
+            return isGoodStory;
+        }
+        
+        // For FOLLOW_UP, check if we got additional details and update the memory fragment
+        if (currentStage === IntroductionStage.FOLLOW_UP) {
+            const hasDetails = message.length > 20;
+            console.log(`[DEBUG] At FOLLOW_UP, has details: ${hasDetails}`);
+            context.conversationHistory
+            if (hasDetails) {
+                // Update the memory fragment with additional details
+                this.updateMemoryFragment(context.userId, message);
+            }
+            
+            return hasDetails;
+        }
+        
+        // For EXPRESS_GRATITUDE, any response advances
+        if (currentStage === IntroductionStage.EXPRESS_GRATITUDE) {
+            console.log(`[DEBUG] At EXPRESS_GRATITUDE, advancing to ESTABLISH_RELATIONSHIP`);
+            return true;
+        }
+        
+        // For all other stages, any response advances
+        console.log(`[DEBUG] Standard stage ${currentStage}, advancing with any response`);
+        return true;
+    }
+
+    // Add this method to fix the casual_conversation node handler
+    private initializeConversationNodes(): void {
+        // Create the casual conversation node
+        this.nodes.set(ConversationNodeType.CASUAL_CONVERSATION, {
+            id: ConversationNodeType.CASUAL_CONVERSATION,
+            nodeType: 'conversation',
+            content: 'Casual conversation with the agent',
+            responses: ['Tell me more', 'That\'s interesting', 'I see'],
+            nextNodes: [ConversationNodeType.CASUAL_CONVERSATION],
+            handler: async (message: string, state: ConversationState, context: any) => {
+                try {
+                    // Add defensive checks for context properties
+                    const narrativeState = context.narrativeState || {};
+                    const memories = context.memories || [];
+                    const agent = context.agent || this.agent;
+                    
+                    // Check if we're still in the introduction flow
+                    if (!narrativeState.hasCompletedIntroduction && narrativeState.introStage) {
+                        // If we're in the introduction flow, use the introduction flow handler
+                        console.log(`[DEBUG] Still in introduction flow, stage: ${narrativeState.introStage}`);
+                        
+                        // Get the appropriate message for this stage
+                        const introFlowManager = new IntroductionFlowManager(this.agentId, this);
+                        const nextStage = this.advanceIntroductionStage(narrativeState.introStage);
+                        
+                        // Save the updated stage
+                        narrativeState.introStage = nextStage;
+                        await this.saveNarrativeState(context.userId, narrativeState);
+                        
+                        // Get the response for the next stage
+                        const responseMessage = this.getIntroductionMessage(agent, nextStage);
+                        
+                        return {
+                            response: responseMessage.agentMessage,
+                            nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                            updatedState: state,
+                            metadata: {
+                                suggestedResponses: responseMessage.suggestedResponses || []
+                            }
+                        };
+                    }
+                    
+                    // Regular casual conversation handling
+                    const prompt = `You are ${agent.name}, a ${agent.category} professional.
+                        You're having a casual conversation with someone you just met.
+                        They just said: "${message}"
+                        
+                        Respond naturally as ${agent.name}, keeping your response friendly and conversational.
+                        Stay in character and maintain your professional persona.`;
+                    
+        const completion = await this.openai.chat.completions.create({
+                        model: "gpt-3.5-turbo",
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+            max_tokens: 150
+        });
+        
+        return {
+                        response: completion.choices[0].message.content || "I'm not sure how to respond to that.",
+            nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                        updatedState: state,
+                        metadata: {}
+                    };
+                } catch (error) {
+                    console.error('[ERROR] Error in casual_conversation handler:', error);
+                    return {
+                        response: "I'm having trouble with our conversation right now. Let's try a different topic.",
+                        nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+                        updatedState: state,
+                        metadata: {}
+                    };
+                }
+            }
+        });
+        
+        // ... other nodes ...
+    }
+
+    // Add method to assess story quality
+    private assessStoryQuality(story: string): boolean {
+        // Simple assessment: check if the story is long enough and contains some key elements
+        const minLength = 30; // Minimum characters for a valid story
+        const hasTimeIndicator = /\b(when|during|after|before|while|year|month|day|time|ago|past|yesterday|today)\b/i.test(story);
+        const hasEventDescription = /\b(happen|experience|witness|see|saw|remember|recall|event)\b/i.test(story);
+        
+        const isLongEnough = story.length >= minLength;
+        
+        // For now, just check if it's long enough - we can make this more sophisticated later
+        return isLongEnough;
+    }
+
+    // Add method to update a memory fragment
+    private async updateMemoryFragment(userId: string, additionalDetails: string): Promise<void> {
+        try {
+            // Get the narrative state to find the memory fragment ID
+            const narrativeState = this.narrativeStates.get(userId);
+            if (!narrativeState?.memoryDetails?.fragmentId) {
+                console.error('[ERROR] No memory fragment ID found in narrative state');
+                return;
+            }
+            
+            const fragmentId = narrativeState.memoryDetails.fragmentId;
+            
+            // Extract additional details
+            const details = await this.extractStoryDetails(additionalDetails);
+            
+            // Find and update the memory fragment
+            const MemoryFragmentModel = mongoose.model('MemoryFragment');
+            const fragment = await MemoryFragmentModel.findById(fragmentId);
+            
+            if (!fragment) {
+                console.error(`[ERROR] Memory fragment not found: ${fragmentId}`);
+                return;
+            }
+            
+            // Update the fragment with new details
+            if (details.location) fragment.location.name = details.location;
+            if (details.date) fragment.date.timestamp = details.date;
+            if (details.approximateDate) fragment.date.approximateDate = details.approximateDate;
+            if (details.people && details.people.length > 0) fragment.people = [...fragment.people, ...details.people];
+            if (details.tags && details.tags.length > 0) fragment.tags = [...fragment.tags, ...details.tags];
+            if (details.emotions && details.emotions.length > 0) fragment.context.emotions = [...fragment.context.emotions, ...details.emotions];
+            
+            // Append the additional details to the description
+            fragment.description += "\n\nAdditional details: " + additionalDetails;
+            
+            // Update status if we have more details
+            if (details.location && details.date) {
+                fragment.status = "complete";
+                fragment.missingFields = [];
+            }
+            
+            await fragment.save();
+            
+            console.log(`[DEBUG] Updated memory fragment: ${fragmentId}`);
+            
+            // Update the narrative state
+            narrativeState.memoryDetails.updated = true;
+            await this.saveNarrativeState(userId, narrativeState);
+            
+        } catch (error) {
+            console.error('[ERROR] Failed to update memory fragment:', error);
+        }
+    }
+
+    // Add method to extract story details using OpenAI
+    private async extractStoryDetails(storyText: string): Promise<any> {
+        try {
+            const prompt = `
+            Extract key details from this personal story:
+            "${storyText}"
+            
+            Return a JSON object with these fields:
+            - title: A short, descriptive title for this memory
+            - date: The date when this happened (ISO format if specific, or null if unclear)
+            - approximateDate: A text description of when it happened (e.g., "Summer of 2019", "Early 90s")
+            - timePeriod: One of CHILDHOOD, TEENAGE_YEARS, YOUNG_ADULT, ADULT, RECENT
+            - location: Where this happened
+            - people: Array of objects with {name, relationship} for people mentioned
+            - emotions: Array of emotions expressed or implied
+            - significance: A number from 1-5 indicating how significant this memory seems
+            - tags: Array of relevant tags/keywords
+            - themes: Array of themes present in the story
+            
+            Only include fields if they can be reasonably inferred from the text.
+            `;
+            
+            const completion = await this.openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.3,
+                max_tokens: 500
+            });
+            
+            const responseText = completion.choices[0].message.content || "{}";
+            
+            // Try to parse the JSON response
+            try {
+                return JSON.parse(responseText);
+            } catch (e) {
+                console.error('[ERROR] Failed to parse OpenAI response:', e);
+                return {};
+            }
+            
+        } catch (error) {
+            console.error('[ERROR] OpenAI extraction failed:', error);
+            return {};
+        }
+    }
+
+    // In the handleMessage method of EnhancedLangGraph class
+    async handleMessage(
+        message: string,
+        context: {
+            agent: AIAgent;
+            userId: string;
+            memories?: AIMemory[];
+            conversationHistory?: ChatMessage[];
+        }
+    ): Promise<{
+        response: string;
+        nextNode: ConversationNodeType;
+        updatedState: ConversationState;
+        metadata?: { 
+            conversationEnded?: boolean;
+            suggestedResponses?: string[];
+        };
+    }> {
+        // Get the narrative state for this user and agent
+        const narrativeState = await this.initializeNarrativeState(context.userId);
+        
+        // Log the current state for debugging
+        logger.info(`[FLOW] Processing input for agent ${context.agent.slug}`, {
+            userId: context.userId,
+            currentNode: this.currentState.currentNode,
+            hasCompletedIntro: narrativeState.hasCompletedIntroduction,
+            introStage: narrativeState.introStage,
+            message: message.substring(0, 50) + (message.length > 50 ? '...' : '')
+        });
+        
+        // FIXED: Determine which flow to use based on introduction completion
+        const useIntroFlow = !narrativeState.hasCompletedIntroduction;
+        
+        logger.info(`[FLOW] Flow decision`, {
+            useIntroFlow,
+            condition1: !narrativeState.hasCompletedIntroduction,
+            condition2: !!narrativeState.introStage,
+            condition3: narrativeState.introStage === IntroductionStage.ESTABLISH_RELATIONSHIP
+        });
+        
+        if (useIntroFlow) {
+            // Use introduction flow
+            logger.info(`[FLOW] Using introduction flow - Stage: ${narrativeState.introStage}`);
+            return await this.introFlowManager.processFlow(message, context, narrativeState);
+        } else {
+            // Use regular conversation flow
+            logger.info(`[FLOW] Using regular conversation flow - Node: ${this.currentState.currentNode}`);
+            return await this.handleCasualConversation(message, context, narrativeState);
+        }
+    }
+
+    private async handleStageFirstFragment(message: string, context: any, narrativeState: AgentNarrativeState): Promise<any> {
+        logger.info(`[MEMORY] Attempting to create memory fragment from user story: "${message.substring(0, 50)}..."`);
+        
+        try {
+            // Try using MemoryFragmentService first
+            const memoryFragmentService = new MemoryFragmentService();
+            logger.info(`[MEMORY] Creating memory fragment with MemoryFragmentService`);
+            
+            let fragment;
+            try {
+                // Create a memory fragment using the dedicated service
+                fragment = await memoryFragmentService.createMemoryFragment(context.userId, {
+                    title: "Conversation Memory",
+                    description: message.substring(0, 100) + "...",
+                    date: {
+                        timestamp: new Date(),
+                        timePeriod: getTimePeriod(new Date())
+                    },
+                    location: {
+                        name: "online"
+                    },
+                    people: [],
+                    tags: ["conversation"],
+                    context: {
+                        emotions: ["neutral"],
+                        significance: 3,
+                        themes: ["conversation"]
+                    },
+                    status: "complete",
+                    conversationId: context.conversationId,  // Move to top level
+                    aiMemoryKey: this.agentId  // Use this field for agent ID
+                });
+                
+                logger.info(`[MEMORY] Successfully created memory fragment with MemoryFragmentService`, {
+                    fragmentId: fragment._id.toString(),
+                    userId: context.userId
+                });
+            } catch (fragmentError) {
+                logger.error(`[MEMORY] Error with MemoryFragmentService, falling back to MemoryService`, fragmentError);
+                
+                // Fall back to MemoryService if MemoryFragmentService fails
+                const memoryService = new MemoryService();
+                fragment = await memoryService.createFromRawInput({
+                    content: message,
+                    source: 'conversation',
+                    userId: context.userId,
+                    metadata: {
+                        agent: this.agentId
+                    }
+                });
+                
+                logger.info(`[MEMORY] Created memory fragment with fallback MemoryService`, {
+                    fragmentId: fragment?._id?.toString()
+                });
+            }
+            
+            if (fragment && fragment._id) {
+                // Store the fragment ID in the narrative state
+                if (!narrativeState.memoryDetails) {
+                    narrativeState.memoryDetails = {};
+                }
+                
+                narrativeState.memoryDetails.fragmentId = fragment._id.toString();
+                narrativeState.memoryDetails.content = message;
+                
+                await this.saveNarrativeState(context.userId, narrativeState);
+                logger.info(`[MEMORY] Saved fragment ID to narrative state: ${fragment._id.toString()}`);
+            } else {
+                logger.error(`[MEMORY] Failed to create memory fragment - no ID returned`);
+            }
+        } catch (error) {
+            logger.error(`[MEMORY] Error creating memory fragment`, error);
+        }
+        
+        // Continue with the rest of the method...
+    }
+
+    // In the EnhancedLangGraph class, add these methods to delegate to introFlowManager
+
+    private advanceToNextStage(nextStage: IntroductionStage, userId: string, narrativeState: AgentNarrativeState): Promise<any> {
+        // Delegate to the introduction flow manager
+        return this.introFlowManager.advanceToNextStage(nextStage, userId, narrativeState);
+    }
+
+    private isPositiveResponse(message: string): boolean {
+        // Delegate to the introduction flow manager
+        return this.introFlowManager.isPositiveResponse(message);
+    }
+
+    private evaluateStoryQuality(message: string): boolean {
+        // Delegate to the introduction flow manager
+        return this.introFlowManager.evaluateStoryQuality(message);
+    }
+
+    // Add this getter to access the graph property
+    get graph(): EnhancedLangGraph {
+        return this;
     }
 } 

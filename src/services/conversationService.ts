@@ -11,6 +11,7 @@ import { AIAgent } from '../types/agent.js';
 import { ConversationNodeType } from '../types/conversation.js';
 import { agentService } from './agentService.js';
 import { OpenAI } from 'openai';
+import { IntroductionStage } from '../types/conversation.js';
 
 
 const memoryService = new MemoryService();
@@ -160,7 +161,8 @@ export class ConversationService {
                     knownTopics: [],
                     sharedStories: [],
                     lastInteractionTimestamp: new Date(),
-                    agentSpecificState: {}
+                    agentSpecificState: {},
+                    introStage: IntroductionStage.INITIAL_GREETING
                 }
             });
             
@@ -187,126 +189,12 @@ export class ConversationService {
     }
 
     // Helper method to generate initial greeting with more natural conversation starters
-    private async generateInitialGreeting(agent: AIAgent, userId?: string): Promise<string> {
-        try {
-            // Check if user has previous conversations with this agent
-            const previousConversations = userId ? 
-                await Conversation.find({ 
-                    userId, 
-                    agentId: agent._id.toString(),
-                    active: false 
-                }).sort({ updatedAt: -1 }).limit(1) : 
-                [];
-            
-            const hasMetBefore = previousConversations.length > 0;
-            
-            // Get any memories about this user
-            const userMemories = userId ? 
-                await this.aiService.getRelevantMemories(userId, agent._id.toString(), "") : 
-                [];
-            
-            // Generate a contextual greeting using OpenAI
-            const openai = new OpenAI({
-                apiKey: process.env.OPENAI_API_KEY
-            });
-            
-            // Create agent-specific scenarios based on their profession
-            const scenarios = {
-                'alex-rivers': [
-                    "just reviewing notes for my next podcast interview",
-                    "setting up my recording equipment for today's show",
-                    "going through listener questions for the podcast",
-                    "researching an interesting guest for next week"
-                ],
-                'chef-isabella': [
-                    "experimenting with a new recipe in the kitchen",
-                    "just got back from the farmer's market with fresh ingredients",
-                    "preparing for a cooking demonstration",
-                    "testing a seasonal menu"
-                ],
-                'morgan-chase': [
-                    "organizing my latest fashion collection",
-                    "just returned from a style consultation",
-                    "reviewing the newest fashion trends",
-                    "preparing for a photoshoot"
-                ]
-            };
-            
-            // Get random scenario for this agent type
-            const agentScenarios = scenarios[agent.slug as keyof typeof scenarios] || [
-                "just wrapping up some work",
-                "organizing my thoughts",
-                "preparing for the day",
-                "taking a short break"
-            ];
-            
-            const randomScenario = agentScenarios[Math.floor(Math.random() * agentScenarios.length)];
-            
-            // Current date for contextual awareness
-            const currentDate = new Date();
-            const formattedDate = currentDate.toLocaleDateString('en-US', { 
-                month: 'long', 
-                day: 'numeric',
-                weekday: 'long'
-            });
-            
-            const completion = await openai.chat.completions.create({
-                model: "gpt-4",
-                messages: [
-                    {
-                        role: "system",
-                        content: `You are ${agent.name}, a ${agent.category} professional.
-                        Your personality traits: ${agent.traits?.core?.join(', ') || 'friendly and helpful'}
-                        Your speaking style: ${agent.style?.speaking?.join(', ') || 'conversational'}
-                        Your tone: ${agent.style?.tone?.join(', ') || 'warm and professional'}
-                        
-                        Today is ${formattedDate}.
-                        
-                        Generate a natural, in-character greeting to start a conversation with a user who just approached you.
-                        You were ${randomScenario} when they arrived.
-                        
-                        ${hasMetBefore ? "You've met this user before." : "This is your first time meeting this user."}
-                        ${userMemories.length > 0 ? `You remember: ${userMemories.map(m => m.content).join(', ')}` : ''}
-                        
-                        The greeting should:
-                        1. Start with a natural reaction to someone approaching you (like "Oh! I didn't see you there" or "Hey there!")
-                        2. Briefly mention what you were just doing (use the scenario provided)
-                        3. Include a topical reference or question that invites conversation
-                        4. Feel spontaneous and natural, as if you're in the middle of your day
-                        5. Be 2-3 sentences maximum
-                        6. Reflect your unique personality and profession
-                        
-                        DO NOT:
-                        - Ask "How can I help you?" or use generic greetings
-                        - Introduce yourself formally unless this is your first meeting
-                        - Sound like a customer service agent
-                        - Use exclamation points excessively
-                        
-                        DO:
-                        - Sound like a real person caught in the middle of an activity
-                        - Use your character's unique voice and perspective
-                        - Include a specific detail that makes the greeting feel authentic`
-                    }
-                ],
-                temperature: 0.8,
-                max_tokens: 200
-            });
-            
-            const generatedGreeting = completion.choices[0].message.content;
-            
-            // Fallback to default greeting if generation fails
-            if (!generatedGreeting) {
-                return agent.style?.greeting || 
-                    `Oh, hey there! I was just ${randomScenario}. I'm ${agent.name}, by the way. What brings you by today?`;
-            }
-            
-            return generatedGreeting;
-        } catch (error) {
-            console.error('Error generating greeting:', error);
-            // Fallback to default greeting if there's an error
-            return agent.style?.greeting || 
-                `Hi there! I'm ${agent.name}, ${agent.bio[0]}. What's on your mind today?`;
-        }
+    private async generateInitialGreeting(agentId: string): Promise<string> {
+        const agent = await agentService.getAgentById(agentId);
+        if (!agent) throw new Error('Agent not found');
+        
+        // Use the same logic as getFirstEncounterMessage
+        return this.getFirstEncounterMessage(agent);
     }
 
     async getConversations(userId: string) {
@@ -333,32 +221,112 @@ export class ConversationService {
         response: string,
         nextNode: ConversationNodeType
     ) {
+        // Get the current conversation to check if we're in introduction
+        const conversation = await Conversation.findOne({
+            userId, 
+            agentId, 
+            active: true
+        });
+        
+        // Only update the node if we're not in introduction or if nextNode isn't 'casual_conversation'
+        const updateFields: any = {
+            $push: {
+                messages: [
+                    {
+                        role: 'user',
+                        content: message,
+                        timestamp: new Date()
+                    },
+                    {
+                        role: 'assistant',
+                        content: response,
+                        timestamp: new Date()
+                    }
+                ]
+            },
+            $set: {
+                updatedAt: new Date()
+            }
+        };
+        
+        // Only update the node if:
+        // 1. We're not in introduction flow, OR
+        // 2. nextNode is not 'casual_conversation' when we're in introduction
+        if (conversation?.narrativeState?.hasCompletedIntroduction || 
+            nextNode !== ConversationNodeType.CASUAL_CONVERSATION) {
+            updateFields.$set.currentNode = nextNode;
+        }
+        
         // Save user message and AI response to the conversation
         const result = await Conversation.findOneAndUpdate(
             { userId, agentId, active: true },
-            {
-                $push: {
-                    messages: [
-                        {
-                            role: 'user',
-                            content: message,
-                            timestamp: new Date()
-                        },
-                        {
-                            role: 'assistant',
-                            content: response,
-                            timestamp: new Date()
-                        }
-                    ]
-                },
-                $set: {
-                    currentNode: nextNode,
-                    updatedAt: new Date()
-                }
-            },
+            updateFields,
             { new: true }
         );
         
         return result;
+    }
+
+    async createOrGetConversation(userId: string, agentId: string, agentSlug: string, forceNew: boolean = false): Promise<any> {
+        try {
+            // Check if a conversation already exists (unless forceNew is true)
+            if (!forceNew) {
+                const existingConversation = await Conversation.findOne({
+                    userId,
+                    agentId,
+                    active: true
+                });
+                
+                if (existingConversation) {
+                    return existingConversation;
+                }
+            } else {
+                // Only delete if forceNew is explicitly set
+                console.log(`Deleting existing conversations - User: ${userId}, Agent: ${agentId}`);
+                await Conversation.deleteMany({
+                    userId,
+                    agentId
+                });
+            }
+            
+            // Create a new conversation with proper narrative state
+            const agent = await agentService.getAgentById(agentId);
+            if (!agent) throw new Error('Agent not found');
+            
+            const narrativeState = {
+                hasCompletedIntroduction: false,
+                relationshipStage: 'stranger',
+                knownTopics: [],
+                sharedStories: [],
+                lastInteractionTimestamp: new Date(),
+                agentSpecificState: {},
+                introStage: IntroductionStage.INITIAL_GREETING
+            };
+            
+            const initialMessage = this.getFirstEncounterMessage(agent);
+            console.log(`Created initial narrative message: "${initialMessage}"`);
+            
+            const conversation = await Conversation.create({
+                userId,
+                agentId,
+                agentSlug,
+                messages: [{
+                    role: 'assistant',
+                    content: initialMessage,
+                    timestamp: new Date()
+                }],
+                currentNode: ConversationNodeType.ENTRY,
+                narrativeState,
+                active: true,
+                createdAt: new Date(),
+                updatedAt: new Date()
+            });
+            
+            console.log(`Created new conversation with ID: ${conversation._id}`);
+            return conversation;
+        } catch (error) {
+            console.error('Error creating/getting conversation:', error);
+            throw error;
+        }
     }
 } 

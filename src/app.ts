@@ -51,7 +51,10 @@ app.get('/api/test', (req, res) => {
 const clientPath = path.join(__dirname, '../dist/client');
 app.use(express.static(clientPath));
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../dist/client/index.html'));
+    // Serve index.html for all routes except /api
+    if (!req.path.startsWith('/api')) {
+        res.sendFile(path.join(__dirname, 'client/index.html'));
+    }
 });
 
 // Add after routes are mounted
@@ -60,9 +63,29 @@ app.use((req, res, next) => {
     next();
 });
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+const PORT = parseInt(process.env.PORT || '5001', 10);
+const server = app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+});
+
+server.on('error', (e: any) => {
+    if (e.code === 'EADDRINUSE') {
+        const newPort = PORT + 1;
+        console.log(`Port ${PORT} is already in use. Trying port ${newPort}`);
+        setTimeout(() => {
+            server.close();
+            const newServer = app.listen(newPort, () => {
+                console.log(`Server running on http://localhost:${newPort}`);
+            });
+            
+            // Transfer error handler to new server
+            newServer.on('error', (e: any) => {
+                console.error('Error starting server on new port:', e);
+            });
+        }, 1000);
+    } else {
+        console.error('Server error:', e);
+    }
 });
 
 export default app; 

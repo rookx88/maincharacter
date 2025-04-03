@@ -10,6 +10,7 @@ import { services } from '../services/index.js';
 import AgentModel from '../models/agentModel.js';
 import { ConversationNodeType } from '../types/conversation.js';
 import { AIMemoryService } from '../services/aiMemoryService.js';
+import { logger } from '../utils/logger.js';
 
 // Create the required services
 const aiMemoryService = new AIMemoryService();
@@ -111,16 +112,39 @@ export class ConversationController {
             const { message, agentSlug } = req.body;
             const userId = req.user.id;
             
-            const response = await services.conversationService.processMessage(
+            console.log('Processing message:', {
                 userId,
-                message,
-                agentSlug
-            );
+                agentSlug,
+                messagePreview: message.substring(0, 50)
+            });
+            
+            try {
+                const response = await services.conversationService.processMessage(
+                    userId,
+                    message,
+                    agentSlug
+                );
 
-            return res.json({ response });
+                console.log('Response generated successfully:', {
+                    responsePreview: typeof response.response === 'string' 
+                        ? response.response.substring(0, 50) 
+                        : 'Non-string response'
+                });
+
+                return res.json({ response });
+            } catch (error) {
+                console.error("Error in conversation service:", error);
+                return res.status(500).json({ 
+                    error: 'Failed to process message',
+                    details: error instanceof Error ? error.message : 'Unknown error'
+                });
+            }
         } catch (error) {
             console.error("Controller error:", error);
-            res.status(500).json({ error: 'Failed to process message' });
+            return res.status(500).json({ 
+                error: 'Failed to process message',
+                details: error instanceof Error ? error.message : 'Unknown error'
+            });
         }
     }
 
@@ -192,22 +216,53 @@ export class ConversationController {
 
 export const processMessage = async (req: Request, res: Response) => {
     try {
-        const { message, agentId, userId } = req.body;
-
-        if (!message || !agentId || !userId) {
-            return res.status(400).json({ error: 'Missing required fields' });
-        }
-
-        const response = await aiService.processMessageWithGraph(
+        const { message, agentSlug } = req.body;
+        const userId = req.user?._id;
+        
+        logger.info(`[API] Received message request`, {
+            userId,
+            agentSlug,
+            messagePreview: message.substring(0, 50) + (message.length > 50 ? '...' : '')
+        });
+        
+        // Get the current conversation node
+        const conversation = await Conversation.findOne({
+            userId,
+            agentSlug,
+            active: true
+        });
+        
+        // Convert string to enum value using type assertion
+        const currentNode = (conversation?.currentNode || 'entry') as ConversationNodeType;
+        
+        logger.info(`[API] Current conversation state`, {
+            currentNode,
+            hasExistingConversation: !!conversation
+        });
+        
+        // Process the message
+        const result = await aiService.processMessageWithGraph(
             userId, 
             message, 
-            agentId,
-            ConversationNodeType.CASUAL_CONVERSATION
+            agentSlug, 
+            currentNode
         );
-        res.json({ response });
+        
+        logger.info(`[API] Sending response to client`, {
+            nextNode: result.nextNode,
+            responsePreview: result.response.substring(0, 50) + (result.response.length > 50 ? '...' : ''),
+            metadata: result.metadata
+        });
+        
+        // Return the result with metadata
+        return res.status(200).json({
+            message: result.response,
+            nextNode: result.nextNode,
+            metadata: result.metadata
+        });
     } catch (error) {
-        console.error('Error processing message:', error);
-        res.status(500).json({ error: 'Failed to process message' });
+        logger.error(`[API] Error processing message`, error);
+        handleError(res, error);
     }
 };
 
@@ -273,21 +328,20 @@ export const sendMessage = async (req: Request, res: Response) => {
         
         // Add detailed debugging
         console.log('Sending response to client:', {
-            message: responseMessage,
+            message: responseMessage.substring(0, 50) + '...',
             conversationEnded: result.metadata?.conversationEnded || false,
-            fullResult: JSON.stringify(result),
-            metadata: result.metadata,
             hasMetadata: !!result.metadata,
             metadataKeys: result.metadata ? Object.keys(result.metadata) : []
         });
         
-        // Create the response object
+        // Create the response object with all necessary fields
         const responseObj = {
             message: responseMessage,
-            conversationEnded: result.metadata?.conversationEnded || false
+            conversationEnded: result.metadata?.conversationEnded || false,
+            suggestedResponses: (result.metadata as any)?.suggestedResponses || []
         };
         
-        console.log('Final response object:', responseObj);
+        console.log('Final response object keys:', Object.keys(responseObj));
         
         res.status(200).json(responseObj);
     } catch (error) {

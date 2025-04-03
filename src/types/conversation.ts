@@ -76,7 +76,6 @@ export enum AgentType {
 
 export enum ConversationNodeType {
     ENTRY = 'entry',
-    FIRST_MEETING = 'first_meeting',
     CASUAL_CONVERSATION = 'casual_conversation',
     REVEAL_OPPORTUNITY = 'reveal_opportunity',
     MINI_GAME = 'mini_game'
@@ -113,14 +112,22 @@ export interface AgentSpecificContent {
 
 export interface ConversationNode {
     id: ConversationNodeType;
-    nodeType: 'greeting' | 'dialogue';
+    nodeType: string;
     content: string;
     responses: string[];
     nextNodes: ConversationNodeType[];
-    handler: (message: string, state: ConversationState, context: any) => Promise<{
+    handler: (
+        message: string, 
+        state: ConversationState, 
+        context: any
+    ) => Promise<{
         response: string;
         nextNode: ConversationNodeType;
         updatedState: Partial<ConversationState>;
+        metadata?: {
+            conversationEnded?: boolean;
+            suggestedResponses?: string[];
+        };
     }>;
 }
 
@@ -132,13 +139,16 @@ export interface AgentNarrativeState {
     lastInteractionTimestamp: Date;
     agentSpecificState: Record<string, any>;
     introStage?: IntroductionStage;
+    stageRepeatCount?: number;
+    memoryDetails?: any;
 }
 
 export enum IntroductionStage {
     INITIAL_GREETING = 'initial_greeting',
     ESTABLISH_SCENARIO = 'establish_scenario',
-    REVEAL_CAPABILITIES = 'reveal_capabilities',
-    REQUEST_ASSISTANCE = 'request_assistance',
+    SEEK_HELP = 'seek_help',
+    FIRST_FRAGMENT = 'first_fragment',
+    FOLLOW_UP = 'follow_up',
     EXPRESS_GRATITUDE = 'express_gratitude',
     ESTABLISH_RELATIONSHIP = 'establish_relationship'
 } 

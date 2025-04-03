@@ -7,6 +7,9 @@ import { DateRange } from '../types/common.js';
 import { getChatCompletion } from '../utils/openai.js';
 import { IConversationDocument } from '../models/conversationModel.js';
 import { RawMemoryInput } from '../types/memory.js';
+import AIMemoryModel from '../models/aiMemoryModel.js';
+import { AIMemory } from '../types/aiMemory.js';
+import { logger } from "../utils/logger.js";
 
 interface MemoryAnalysis {
     significance: number;
@@ -129,8 +132,10 @@ export class MemoryService {
         return JSON.parse(result);
     }
 
-    async createFromRawInput(rawInput: RawMemoryInput) {
+    async createFromRawInput(rawInput: RawMemoryInput): Promise<MemoryFragmentDocument> {
         try {
+            logger.info(`[MEMORY] Creating memory from raw input: "${rawInput.content.substring(0, 50)}..."`);
+            
             const memory = await MemoryFragment.create({
                 content: rawInput.content,
                 source: rawInput.source,
@@ -138,9 +143,56 @@ export class MemoryService {
                 metadata: rawInput.metadata,
                 status: 'needs_processing'
             });
+            
+            logger.info(`[MEMORY] Created memory fragment with ID: ${memory._id.toString()}`);
             return memory;
         } catch (error) {
-            console.error('Error creating memory from raw input:', error);
+            logger.error(`[MEMORY] Error creating memory from raw input:`, error);
+            throw error;
+        }
+    }
+
+    async searchMemories(userId: string, agentId: string, query: string): Promise<AIMemory[]> {
+        try {
+            // Simple implementation - could be enhanced with vector search
+            const memories = await AIMemoryModel.find({
+                userId,
+                agentId
+            }).sort({ createdAt: -1 }).limit(10);
+            
+            return memories;
+        } catch (error) {
+            console.error('Error searching memories:', error);
+            return [];
+        }
+    }
+
+    async createMemory(memoryData: {
+        userId: string;
+        agentId: string;
+        content: string;
+        source: string;
+        type: string;
+        metadata: any;
+        importance: number;
+        createdAt: Date;
+    }): Promise<AIMemory> {
+        try {
+            const memory = new AIMemoryModel({
+                userId: memoryData.userId,
+                agentId: memoryData.agentId,
+                content: memoryData.content,
+                source: memoryData.source,
+                type: memoryData.type,
+                metadata: memoryData.metadata,
+                importance: memoryData.importance,
+                createdAt: memoryData.createdAt || new Date()
+            });
+            
+            await memory.save();
+            return memory;
+        } catch (error) {
+            logger.error(`[MEMORY] Error creating memory`, error);
             throw error;
         }
     }

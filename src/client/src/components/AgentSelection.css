@@ -489,4 +489,33 @@
 .teaser {
     color: #333;
     font-style: italic;
+}
+
+.agent-avatar {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #3b82f6;
+    color: white;
+    font-size: 2rem;
+    font-weight: bold;
+    margin-right: 1rem;
+}
+
+.agent-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.agent-initial {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
 } 
