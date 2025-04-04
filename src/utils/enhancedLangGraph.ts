@@ -1,3 +1,4 @@
+/*
 import { 
     ConversationNodeType, 
     ConversationState,
@@ -46,7 +47,7 @@ class IntroductionFlowManager {
     private narrativeStates: Map<string, AgentNarrativeState>;
     private narrativeStateModel: any;
     
-    constructor(private agentId: string, private graph: EnhancedLangGraph) {
+    constructor(private agentId: string, private graph: EnhancedLangGraph, public agent?: AIAgent) {
         this.narrativeStates = new Map();
         this.narrativeStateModel = mongoose.model('Conversation');
     }
@@ -311,7 +312,13 @@ class IntroductionFlowManager {
     
     // Generate a response for a specific stage
     private generateStageResponse(stage: IntroductionStage, context: any, userMessage: string): string {
-        const introMessage = this.getIntroductionMessage(context.agent, stage);
+        // Make sure we have the agent
+        if (!this.agent && context && context.agent) {
+            this.agent = context.agent;
+        }
+        
+        // Pass the entire context object instead of just context.agent
+        const introMessage = this.getIntroductionMessage(stage, context);
         
         // Log the intro message for debugging
         logger.info(`[FLOW] Generating response for stage ${stage}`, {
@@ -396,7 +403,18 @@ class IntroductionFlowManager {
     
     
     // Get introduction message for a specific stage
-    private getIntroductionMessage(agent: any, stage: IntroductionStage): IntroductionPrompt {
+    private getIntroductionMessage(stage: IntroductionStage, context: any): any {
+        // Make sure we have the agent
+        if (!this.agent && context && context.agent) {
+            this.agent = context.agent;
+        }
+        
+        // Use this.agent instead of relying on context.agent
+        const agent = this.agent || { slug: 'unknown', name: 'AI Assistant' };
+        
+        // Now we can safely use agent.slug
+        const agentSlug = agent.slug;
+        
         // Define introduction messages for each agent and stage
         const introMessages: Record<string, Record<IntroductionStage, IntroductionPrompt>> = {
             'alex-rivers': {
@@ -533,7 +551,7 @@ class IntroductionFlowManager {
         };
         
         // Get the messages for this agent, or use a default if not found
-        const agentMessages = introMessages[agent.slug] || introMessages['alex-rivers'];
+        const agentMessages = introMessages[agentSlug] || introMessages['alex-rivers'];
         
         // Return the message for this stage, or a default if not found
         return agentMessages[stage] || {
@@ -1047,6 +1065,9 @@ class IntroductionFlowManager {
         
         return hasNarrativeElements;
     }
+
+    // In the IntroductionFlowManager.getIntroductionMessage method
+    
 }
 
 export class EnhancedLangGraph {
@@ -1097,8 +1118,8 @@ export class EnhancedLangGraph {
             apiKey: process.env.OPENAI_API_KEY
         });
         
-        // Initialize the introduction flow manager
-        this.introFlowManager = new IntroductionFlowManager(this.agentId, this);
+        // Initialize the introduction flow manager with the agent
+        this.introFlowManager = new IntroductionFlowManager(this.agentId, this, this.agent);
         
         // Initialize the conversation nodes
         this.initializeConversationNodes();
@@ -1579,6 +1600,11 @@ Respond naturally while staying in character.`;
         updatedState: ConversationState;
         metadata?: { conversationEnded?: boolean };
     }> {
+        // Make sure the agent is set in the introFlowManager
+        if (context.agent && !this.introFlowManager.agent) {
+            this.introFlowManager.agent = context.agent;
+        }
+        
         // Get or initialize narrative state
         const sessionKey = this.getSessionKey(context.userId, this.agentId);
         let narrativeState = await this.getNarrativeState(context.userId);
@@ -3244,4 +3270,4 @@ Respond naturally while staying in character.`;
     get graph(): EnhancedLangGraph {
         return this;
     }
-} 
+}*/ 

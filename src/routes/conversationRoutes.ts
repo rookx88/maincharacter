@@ -1,89 +1,26 @@
+// src/routes/conversationRoutes.ts
 import { Router } from 'express';
-import { ConversationController } from '../controllers/conversationController.js';
+import ConversationController from '../controllers/conversationController.js';
 import authMiddleware from '../middleware/authMiddleware.js';
-import { services } from '../services/index.js';
-import Conversation from '../models/conversationModel.js';
-import { agentService } from '../services/agentService.js';
 
 const router = Router();
-const conversationController = new ConversationController();
 
-// Get list of available conversation agents
-router.get("/agents", async (req, res) => {
-    try {
-        const agents = await services.conversationService.getAgents();
-        res.json(agents);
-    } catch (error) {
-        console.error('Error fetching agents:', error);
-        res.status(500).json({ error: 'Failed to fetch agents' });
-    }
-});
+// Get all available agents
+router.get('/agents', ConversationController.getAgents.bind(ConversationController));
 
 // Start or continue a conversation
-router.post("/start", authMiddleware, async (req, res) => {
-    try {
-        await conversationController.startConversation(req, res);
-    } catch (error) {
-        console.error('Conversation creation error:', error);
-        res.status(500).json({ 
-            error: 'Failed to start conversation',
-            details: error instanceof Error ? error.message : 'Unknown error'
-        });
-    }
-});
+router.post('/start', authMiddleware, ConversationController.startConversation.bind(ConversationController));
 
-// Send a message to the AI
-router.post('/message', authMiddleware, async (req, res) => {
-    try {
-        await conversationController.chat(req, res);
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({ 
-            error: 'Failed to process message',
-            details: error instanceof Error ? error.message : 'Unknown error'
-        });
-    }
-});
-
-router.delete('/:agentSlug', authMiddleware, conversationController.deleteConversation);
+// Send a message to the agent
+router.post('/message', authMiddleware, ConversationController.chat.bind(ConversationController));
 
 // Get messages for a specific agent
-router.get('/:agentSlug/messages', authMiddleware, async (req, res) => {
-    try {
-        const { agentSlug } = req.params;
-        const userId = req.user?.id;
+router.get('/:agentSlug/messages', authMiddleware, ConversationController.getMessages.bind(ConversationController));
 
-        if (!userId) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
+// Delete a conversation
+router.delete('/:agentSlug', authMiddleware, ConversationController.deleteConversation.bind(ConversationController));
 
-        console.log(`Getting messages - User: ${userId}, Agent: ${agentSlug}`);
-        
-        const agent = await agentService.getAgentBySlug(agentSlug);
-        if (!agent) {
-            return res.status(404).json({ error: 'Agent not found' });
-        }
-
-        const conversation = await Conversation.findOne({
-            userId,
-            agentSlug,
-            active: true
-        }).sort({ updatedAt: -1 });
-
-        if (!conversation) {
-            return res.status(200).json({ messages: [] });
-        }
-
-        console.log(`Found conversation with ${conversation.messages.length} messages`);
-        
-        return res.status(200).json({ 
-            messages: conversation.messages,
-            conversationId: conversation._id
-        });
-    } catch (error) {
-        console.error('Error getting messages:', error);
-        return res.status(500).json({ error: 'Failed to get messages' });
-    }
-});
+// Get memory fragments for a user
+router.get('/memories/:userId', authMiddleware, ConversationController.getMemoryFragments.bind(ConversationController));
 
 export default router;

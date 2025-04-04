@@ -5,7 +5,7 @@ import { ConversationError } from '../utils/conversationError.js';
 
 import { getChatCompletion } from '../utils/openai.js';
 import { PromptTemplate } from "@langchain/core/prompts";
-import { StructuredOutputParser } from "langchain/output_parsers";
+import { StructuredOutputParser } from "@langchain/core/output_parsers";
 import { ChatOpenAI } from "@langchain/openai";
 import { RunnableSequence } from "@langchain/core/runnables";
 import { MemoryService } from './memoryService.js';

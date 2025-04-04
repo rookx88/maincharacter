@@ -1,232 +1,266 @@
-import ConversationModel from '../models/conversationModel.js';
-import { ConversationError } from '../utils/conversationError.js';
-
-import { ChatMessage } from '../types/conversation.js';
-import { TimePeriod } from '../types/common.js';
 import { OpenAI } from 'openai';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { AIAgent } from '../types/agent.js';
-import Conversation from '../models/conversationModel.js';
-import { AIMemory } from '../types/aiMemory.js';
-import { agentService } from './agentService.js';
-import { EnhancedLangGraph, EnhancedLangGraphConfig } from '../utils/enhancedLangGraph.js';
-import { AIMemoryService } from './aiMemoryService.js';
-import { ConversationCheckpoint } from '../utils/conversationCheckpoints.js';
-import { AgentType, ConversationState, ConversationNodeType } from '../types/conversation.js';
-import mongoose from 'mongoose';
-import { ConversationNode } from '../types/conversation.js';
-import AgentModel from '../models/agentModel.js';
-import { MemoryService } from './memoryService.js';
+import { ChatMessage } from '../types/conversation.js';
 import { logger } from '../utils/logger.js';
 
-type Message = {
-    role: "system" | "user" | "assistant";
-    content: string;
-    timestamp: Date;
-};
-
 export class AIService {
-    private graphCache: Map<string, EnhancedLangGraph> = new Map();
-    private openai: OpenAI;
-    private memoryService: MemoryService;
+  private openai: OpenAI;
 
-    constructor() {
-        this.openai = new OpenAI({
-            apiKey: process.env.OPENAI_API_KEY
+  constructor() {
+    this.openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+  }
+
+  /**
+   * Generate AI response based on given context
+   */
+  async generateResponse(
+    prompt: string,
+    context: {
+      userMessage: string;
+      agent: AIAgent;
+      conversationHistory?: ChatMessage[];
+    }
+  ): Promise<string> {
+    logger.info('[AI] Generating response', {
+      agent: context.agent.name,
+      messageExcerpt: context.userMessage.substring(0, 50) + (context.userMessage.length > 50 ? '...' : '')
+    });
+
+    try {
+      // Create system message with agent's persona
+      const systemPrompt = `You are ${context.agent.name}, a ${context.agent.category} professional.
+Your personality: ${context.agent.traits?.core?.join(', ') || 'friendly and helpful'}
+Your speaking style: ${context.agent.style?.speaking?.join(', ') || 'natural and engaging'}
+
+${prompt}
+
+Stay in character as ${context.agent.name} at all times. Be natural and conversational.`;
+      
+      // Build conversation history for context
+      const messages: ChatCompletionMessageParam[] = [
+        { role: "system", content: systemPrompt }
+      ];
+      
+      // Add up to 10 recent messages from conversation history if available
+      if (context.conversationHistory && context.conversationHistory.length > 0) {
+        const recentHistory = context.conversationHistory.slice(-10);
+        recentHistory.forEach(msg => {
+          if (msg.role === 'user' || msg.role === 'assistant' || msg.role === 'system') {
+            messages.push({
+              role: msg.role,
+              content: msg.content
+            });
+          }
         });
-        this.memoryService = new MemoryService();
+      }
+      
+      // Add the current user message
+      messages.push({ role: "user", content: context.userMessage });
+      
+      // Generate response
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages,
+        temperature: context.agent.temperature || 0.7,
+        max_tokens: 500
+      });
+      
+      const response = completion.choices[0].message.content || "I'm not sure how to respond to that.";
+      logger.info('[AI] Generated response', {
+        responseExcerpt: response.substring(0, 50) + (response.length > 50 ? '...' : '')
+      });
+      
+      return response;
+    } catch (error) {
+      logger.error('[AI] Failed to generate response', error);
+      return "I'm having trouble processing that right now. Can we try something else?";
     }
+  }
 
-    async getOrCreateGraph(
-        agentId: string, 
-        userId: string, 
-        currentNode: ConversationNodeType
-    ): Promise<EnhancedLangGraph> {
-        const cacheKey = `${userId}-${agentId}`;
+  /**
+   * Analyze message significance
+   */
+  async analyzeSignificance(message: string): Promise<number> {
+    logger.info('[AI] Analyzing message significance');
+    
+    try {
+      const prompt = `On a scale of 0 to 1, how significant is this message in terms of personal information or memorable content:
+        "${message}"
         
-        if (!this.graphCache.has(cacheKey)) {
-            // Get conversation from database to initialize with correct state
-            const conversation = await Conversation.findOne({
-                userId,
-                agentId,
-                active: true
-            });
-            
-            const agent = await agentService.getAgentById(agentId);
-            if (!agent) throw new Error('Agent not found');
-            
-            // Use existing state from database or create default
-            // IMPORTANT: For new conversations, always start with ENTRY node
-            const initialNode = conversation?.currentNode || ConversationNodeType.ENTRY;
-            
-            logger.info(`[GRAPH] Creating new graph`, {
-                userId,
-                agentId,
-                initialNode,
-                isExistingConversation: !!conversation
-            });
-            
-            const graph = new EnhancedLangGraph(agentId, {
-                initialNode: initialNode as ConversationNodeType,
-                nodes: new Map(),
-                edges: new Map(),
-                memories: [],
-                agent,
-                conversation
-            });
-            
-            this.graphCache.set(cacheKey, graph);
-        }
+        Respond with a single number between 0 and 1, with no other text.`;
+      
+      const messages: ChatCompletionMessageParam[] = [
+        { role: "user", content: prompt }
+      ];
+      
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages,
+        temperature: 0.1,
+        max_tokens: 10
+      });
+      
+      const result = completion.choices[0].message.content || "0.5";
+      const significance = parseFloat(result);
+      
+      logger.info('[AI] Significance analysis complete', { significance });
+      return isNaN(significance) ? 0.5 : significance;
+    } catch (error) {
+      logger.error('[AI] Failed to analyze significance', error);
+      return 0.5;
+    }
+  }
+
+  /**
+   * Detect emotions in a message
+   */
+  async detectEmotions(message: string): Promise<string[]> {
+    logger.info('[AI] Detecting emotions');
+    
+    try {
+      const prompt = `Identify the top 3 emotions expressed in this message. Return only a comma-separated list of emotion words:
+        "${message}"`;
+      
+      const messages: ChatCompletionMessageParam[] = [
+        { role: "user", content: prompt }
+      ];
+      
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages,
+        temperature: 0.3,
+        max_tokens: 50
+      });
+      
+      const content = completion.choices[0].message.content || "neutral";
+      const emotions = content.split(',').map(e => e.trim()).filter(Boolean);
+      
+      return emotions.length > 0 ? emotions : ["neutral"];
+    } catch (error) {
+      logger.error('[AI] Failed to detect emotions', error);
+      return ["neutral"];
+    }
+  }
+
+  /**
+   * Extract key themes from a message
+   */
+  async extractThemes(message: string): Promise<string[]> {
+    logger.info('[AI] Extracting themes');
+    
+    try {
+      const prompt = `Extract 3-5 key themes or topics from this text. Return only a comma-separated list of theme words or short phrases:
+        "${message}"`;
+      
+      const messages: ChatCompletionMessageParam[] = [
+        { role: "user", content: prompt }
+      ];
+      
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages,
+        temperature: 0.3,
+        max_tokens: 100
+      });
+      
+      const content = completion.choices[0].message.content || "";
+      const themes = content.split(',').map(t => t.trim()).filter(Boolean);
+      
+      return themes;
+    } catch (error) {
+      logger.error('[AI] Theme extraction failed', error);
+      return [];
+    }
+  }
+
+  /**
+   * Generate a memory title based on content
+   */
+  async generateMemoryTitle(content: string): Promise<string> {
+    logger.info('[AI] Generating memory title');
+    
+    try {
+      const prompt = `Create a short, descriptive title (5-8 words) for this memory:
+        "${content}"
         
-        return this.graphCache.get(cacheKey)!;
+        Return just the title, nothing else.`;
+      
+      const messages: ChatCompletionMessageParam[] = [
+        { role: "user", content: prompt }
+      ];
+      
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages,
+        temperature: 0.7,
+        max_tokens: 20
+      });
+      
+      const title = completion.choices[0].message.content?.trim() || "Memory";
+      logger.info('[AI] Generated title', { title });
+      
+      return title;
+    } catch (error) {
+      logger.error('[AI] Failed to generate title', error);
+      return "Memory";
     }
+  }
 
-    async processMessageWithGraph(
-        userId: string,
-        message: string,
-        agentSlug: string,
-        currentNode: ConversationNodeType
-    ): Promise<{
-        response: string;
-        nextNode: ConversationNodeType;
-        updatedState: ConversationState;
-        metadata?: { conversationEnded?: boolean };
-    }> {
-        logger.info(`[API] Processing message with graph`, {
-            userId,
-            agentSlug,
-            currentNode,
-            messagePreview: message.substring(0, 50) + (message.length > 50 ? '...' : '')
-        });
-
-        const agent = await agentService.getAgentBySlug(agentSlug);
-        if (!agent) throw new Error('Agent not found');
-
-        // Get or create the graph
-        const graph = await this.getOrCreateGraph(agent._id.toString(), userId, currentNode);
-        
-        // Get conversation history once
-        const conversationHistory = await this.getConversationHistory(userId, agent._id.toString());
-        
-        // Get relevant memories once
-        const memories = await this.getRelevantMemories(userId, agent._id.toString(), message);
-        
-        // Process the input with all context in one call
-        const result = await graph.processInput(message, {
-            agent,
-            userId,
-            memories,
-            conversationHistory,
-            currentNode
-        });
-        
-        logger.info(`[API] Graph processing result`, {
-            nextNode: result.nextNode,
-            responsePreview: result.response.substring(0, 50) + (result.response.length > 50 ? '...' : ''),
-            metadata: result.metadata
-        });
-        
-        return result;
+  /**
+   * Generate suggested responses for the user
+   */
+  async generateSuggestedResponses(
+    message: string,
+    context: {
+      agent: AIAgent;
+      conversationStage: string;
+    },
+    count: number = 3
+  ): Promise<string[]> {
+    logger.info('[AI] Generating suggested responses', { 
+      conversationStage: context.conversationStage 
+    });
+    
+    try {
+      const prompt = `You are speaking with ${context.agent.name}, a ${context.agent.category}.
+      They just said: "${message}"
+      
+      Generate ${count} natural, conversational responses a user might say in reply.
+      The current context is: ${context.conversationStage}
+      
+      Format as a JSON array of strings, with each response being 1-10 words. 
+      Make responses varied in tone and content.`;
+      
+      const messages: ChatCompletionMessageParam[] = [
+        { role: "user", content: prompt }
+      ];
+      
+      const completion = await this.openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages,
+        temperature: 0.8,
+        max_tokens: 150,
+        response_format: { type: "json_object" }
+      });
+      
+      const content = completion.choices[0].message.content;
+      if (!content) return [];
+      
+      try {
+        const parsed = JSON.parse(content);
+        return Array.isArray(parsed) ? parsed : (parsed.responses || []);
+      } catch (e) {
+        logger.error('[AI] Failed to parse suggested responses', e);
+        return [];
+      }
+    } catch (error) {
+      logger.error('[AI] Failed to generate suggested responses', error);
+      return [];
     }
+  }
+}
 
-    async getConversationHistory(userId: string, agentId: string): Promise<ChatMessage[]> {
-        const conversation = await ConversationModel.findOne({
-            userId,
-            agentId,
-            active: true
-        }).sort({ 'messages.timestamp': -1 });
-        
-        return conversation?.messages || [];
-    }
-
-    private async loadProfile(agentId: string): Promise<AIAgent> {
-        const agent = await agentService.getAgentById(agentId);
-        if (!agent) throw new Error('Agent not found');
-        return agent;
-    }
-
-    private constructSystemMessage(profile: AIAgent, context: Message[]): string {
-        const isFirstEncounter = context.length === 0;
-        
-        return `You are ${profile.name}. ${profile.bio[0]}
-
-${isFirstEncounter ? 'This is your first conversation with this user.' : 'Continue the existing conversation naturally.'}
-
-Your personality traits are: ${profile.traits?.core?.join(', ') || 'friendly and helpful'}`;
-    }
-
-    async getUserConversations(userId: string) {
-        try {
-            const conversations = await ConversationModel.find({ 
-                userId: userId 
-            }).sort({ 
-                'messages.timestamp': 1
-            });
-
-            if (!conversations) {
-                return [];
-            }
-
-            return conversations.map(conv => ({
-                _id: conv._id,
-                agentSlug: conv.agentSlug,
-                messages: conv.messages.map(msg => ({
-                    content: msg.content,
-                    timestamp: msg.timestamp,
-                    role: msg.role
-                }))
-            }));
-        } catch (error) {
-            console.error('Error fetching user conversations:', error);
-            throw new ConversationError('Failed to fetch conversations', 500);
-        }
-    }
-
-    async findBySlug(slug: string) {
-        return agentService.getAgentBySlug(slug);
-    }
-
-    async getAgentProfile(agentId: string) {
-        return await agentService.getAgentById(agentId);
-    }
-
-    async getConversationContext(userId: string, agentId: string): Promise<Message[]> {
-        try {
-            // Get previous messages from the database
-            const conversation = await ConversationModel.findOne({
-                userId,
-                agentId,
-                active: true
-            }).sort({ 'messages.timestamp': -1 });
-
-            console.log('Retrieved conversation context:', {
-                userId,
-                agentId,
-                hasConversation: !!conversation,
-                messageCount: conversation?.messages?.length || 0
-            });
-
-            return conversation?.messages || [];
-        } catch (error) {
-            console.error('Error getting conversation context:', error);
-            return [];
-        }
-    }
-
-    async chat(agentId: string, userId: string, message: string) {
-        console.log("AIService processing:", { agentId, userId, message });
-        
-        const agent = await this.loadProfile(agentId);
-        if (!agent) throw new Error('Agent not found');
-
-        return await this.processMessageWithGraph(
-            userId,
-            message,
-            agent.slug,
-            ConversationNodeType.ENTRY
-        );
-    }
-
-    public async getRelevantMemories(userId: string, agentId: string, query: string): Promise<AIMemory[]> {
-        return this.memoryService.searchMemories(userId, agentId, query);
-    }
-} 
+export default new AIService();

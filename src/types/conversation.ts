@@ -140,7 +140,10 @@ export interface AgentNarrativeState {
     agentSpecificState: Record<string, any>;
     introStage?: IntroductionStage;
     stageRepeatCount?: number;
-    memoryDetails?: any;
+    memoryDetails?: {
+        fragmentId: string;
+        content: string;
+    };
 }
 
 export enum IntroductionStage {
