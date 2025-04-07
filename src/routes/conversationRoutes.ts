@@ -1,4 +1,3 @@
-// src/routes/conversationRoutes.ts
 import { Router } from 'express';
 import ConversationController from '../controllers/conversationController.js';
 import authMiddleware from '../middleware/authMiddleware.js';

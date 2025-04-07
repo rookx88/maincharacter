@@ -18,92 +18,101 @@ export class AIMemoryService {
         });
     }
 
-    async getCheckpointMemories(
+    // Refactored method to match the newer interface pattern
+    async createMemoryFromMessage(
         userId: string,
         agentId: string,
-        checkpoint: ConversationCheckpoint,
-        currentMessage: string
-    ): Promise<{
-        relevantMemories: AIMemory[];
-        recentContext: ChatMessage[];
-        significance: number;
-    }> {
-        // Get message embedding for similarity comparison
-        const messageEmbedding = await this.embeddings.embedQuery(currentMessage);
-
-        // Get memories based on checkpoint requirements
-        const memories = await this.getMemoriesByCheckpoint(
+        message: string,
+        conversationId?: string
+    ): Promise<AIMemory> {
+        // Determine the memory type/significance
+        const significance = await this.analyzeSignificance(message);
+        
+        // Create a memory object
+        return await AIMemoryModel.create({
             userId,
             agentId,
-            checkpoint
-        );
-
-        // Calculate memory relevance
-        const scoredMemories = await this.scoreMemories(
-            memories,
-            messageEmbedding
-        );
-
-        // Get recent conversation context
-        const recentContext = await this.getRecentContext(userId, agentId);
-
-        // Calculate overall significance for checkpoint progression
-        const significance = this.calculateSignificance(
-            scoredMemories,
-            checkpoint
-        );
-
-        return {
-            relevantMemories: scoredMemories
-                .sort((a, b) => b.score - a.score)
-                .slice(0, 3)
-                .map(m => m.memory),
-            recentContext,
-            significance
-        };
+            content: message,
+            type: this.getMemoryType(message),
+            significance,
+            timestamp: new Date(),
+            lastAccessed: new Date(),
+            conversationId
+        });
     }
 
-    private async getMemoriesByCheckpoint(
-        userId: string,
-        agentId: string,
-        checkpoint: ConversationCheckpoint
-    ): Promise<AIMemory[]> {
-        const baseQuery = {
-            userId,
-            agentId,
-            significance: { $gt: 0.5 }
-        };
-
-        switch (checkpoint) {
-            case ConversationCheckpoint.STORY_DISCOVERY:
-                return await AIMemoryModel.find({
-                    ...baseQuery,
-                    type: 'story_element',
-                    significance: { $gt: 0.7 }
-                }).sort({ timestamp: -1 }).limit(5);
-
-            case ConversationCheckpoint.DEEPENING:
-                return await AIMemoryModel.find({
-                    ...baseQuery,
-                    type: 'significant_moment',
-                    significance: { $gt: 0.8 }
-                }).sort({ significance: -1 }).limit(3);
-
-            case ConversationCheckpoint.REVEAL_PREP:
-                return await AIMemoryModel.find({
-                    ...baseQuery,
-                    type: ['story_element', 'significant_moment'],
-                    significance: { $gt: 0.9 }
-                }).sort({ significance: -1 }).limit(2);
-
-            default:
-                return await AIMemoryModel.find(baseQuery)
-                    .sort({ timestamp: -1 })
-                    .limit(3);
+    // Make analyze significance public so it can be used by adapters
+    public async analyzeSignificance(message: string): Promise<number> {
+        // Implement significance analysis using LLM
+        try {
+            const prompt = `On a scale of 0 to 1, how significant is this message in terms of personal information or memorable content:
+                "${message}"
+                
+                Respond with a single number between 0 and 1, with no other text.`;
+            
+            const completion = await this.openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [{ role: "user", content: prompt }],
+                temperature: 0.1,
+                max_tokens: 10
+            });
+            
+            const result = completion.choices[0].message.content || "0.5";
+            const significance = parseFloat(result.trim());
+            
+            return isNaN(significance) ? 0.5 : Math.min(Math.max(significance, 0), 1);
+        } catch (error) {
+            console.error('Error analyzing significance:', error);
+            return 0.5;
         }
     }
 
-    private async scoreMemories(
+    // Helper method to determine memory type based on content
+    private getMemoryType(message: string): string {
+        // Simple logic to determine memory type
+        if (message.length > 200) {
+            return 'significant_moment';
+        } else if (message.includes('remember') || message.includes('recall')) {
+            return 'story_element';
+        } else {
+            return 'general';
+        }
+    }
+
+    async getRelevantMemories(
+        userId: string,
+        agentId: string,
+        message: string,
+        limit: number = 5
+    ): Promise<AIMemory[]> {
+        try {
+            // Get message embedding for similarity comparison
+            const messageEmbedding = await this.embeddings.embedQuery(message);
+
+            // Get memories
+            const memories = await AIMemoryModel.find({
+                userId,
+                agentId
+            }).sort({ significance: -1 }).limit(limit * 2);  // Get extra to filter by relevance
+
+            if (memories.length === 0) return [];
+
+            // Score memories by relevance
+            const scoredMemories = await this.scoreMemoriesByRelevance(memories, messageEmbedding);
+
+            // Return most relevant memories
+            return scoredMemories
+                .sort((a, b) => b.score - a.score)
+                .slice(0, limit)
+                .map(item => item.memory);
+        } catch (error) {
+            console.error('Error getting relevant memories:', error);
+            return [];
+        }
+    }
+
+    // Helper to score memories by relevance
+    private async scoreMemoriesByRelevance(
         memories: AIMemory[],
         messageEmbedding: number[]
     ): Promise<Array<{ memory: AIMemory; score: number }>> {
@@ -115,131 +124,95 @@ export class AIMemoryService {
 
         return memories.map((memory, index) => ({
             memory,
-            score: similarity(messageEmbedding, memoryEmbeddings[index])
+            score: similarity(messageEmbedding, memoryEmbeddings[index]) * memory.significance
         }));
     }
 
-    private async getRecentContext(
-        userId: string,
-        agentId: string
-    ): Promise<ChatMessage[]> {
-        const conversation = await Conversation.findOne(
-            { userId, agentId, active: true },
-            { messages: { $slice: -5 } }
-        );
+    async updateMemoryWithDetails(
+        memoryId: string,
+        additionalDetails: string
+    ): Promise<AIMemory | null> {
+        try {
+            const memory = await AIMemoryModel.findById(memoryId);
+            if (!memory) return null;
 
-        return conversation?.messages || [];
-    }
-
-    private calculateSignificance(
-        scoredMemories: Array<{ memory: AIMemory; score: number }>,
-        checkpoint: ConversationCheckpoint
-    ): number {
-        const averageScore = scoredMemories.reduce(
-            (acc, { score }) => acc + score, 0
-        ) / scoredMemories.length;
-
-        const checkpointMultipliers: Record<ConversationCheckpoint, number> = {
-            [ConversationCheckpoint.ENTRY]: 1.0,
-            [ConversationCheckpoint.FIRST_MEETING]: 1.0,
-            [ConversationCheckpoint.RETURNING]: 1.0,
-            [ConversationCheckpoint.STORY_DISCOVERY]: 1.2,
-            [ConversationCheckpoint.DEEPENING]: 1.5,
-            [ConversationCheckpoint.REVEAL_PREP]: 2.0,
-            [ConversationCheckpoint.REVEAL]: 1.0,
-            [ConversationCheckpoint.ACTIVITY]: 1.0
-        };
-
-        return Math.min(1.0, averageScore * (checkpointMultipliers[checkpoint]));
-    }
-
-    async createMemoryFromMessage(
-        message: string,
-        userId: string,
-        agentId: string,
-        checkpoint: ConversationCheckpoint
-    ): Promise<AIMemory> {
-        const significance = await this.analyzeSignificance(message);
-        
-        return await AIMemoryModel.create({
-            userId,
-            agentId,
-            content: message,
-            type: this.getMemoryType(checkpoint),
-            significance,
-            timestamp: new Date()
-        });
-    }
-
-    private async analyzeSignificance(message: string): Promise<number> {
-        // Implement significance analysis using LLM
-        // For now, return a placeholder
-        return 0.7;
-    }
-
-    private getMemoryType(checkpoint: ConversationCheckpoint): string {
-        switch (checkpoint) {
-            case ConversationCheckpoint.STORY_DISCOVERY:
-                return 'story_element';
-            case ConversationCheckpoint.DEEPENING:
-                return 'significant_moment';
-            default:
-                return 'general';
+            // Add additional details
+            memory.content += "\n\nAdditional details: " + additionalDetails;
+            
+            // Recalculate significance with additional details
+            const newSignificance = await this.analyzeSignificance(memory.content);
+            memory.significance = Math.max(memory.significance, newSignificance);
+            
+            // Update last accessed timestamp
+            memory.lastAccessed = new Date();
+            
+            await memory.save();
+            return memory;
+        } catch (error) {
+            console.error('Error updating memory:', error);
+            return null;
         }
     }
 
-    async storeMemory(memory: AIMemory) {
-        return await AIMemoryModel.create(memory);
-    }
-
-    async getRelevantMemories(
+    async searchMemories(
         userId: string,
         agentId: string,
-        message: string,
+        query: string,
         limit: number = 5
     ): Promise<AIMemory[]> {
+        // For simple implementation, we'll reuse getRelevantMemories
+        return this.getRelevantMemories(userId, agentId, query, limit);
+    }
+
+    async getMemoriesInTimeframe(
+        userId: string,
+        timeframe: { from: Date, to: Date }
+    ): Promise<AIMemory[]> {
         try {
-            // Get most significant memories first
-            const memories = await MemoryModel.find({
+            return await AIMemoryModel.find({
                 userId,
-                agentId
-            })
-            .sort({ significance: -1 })
-            .limit(limit);
-
-            if (!memories.length) return [];
-
-            // Return most significant memories
-            return memories as unknown as AIMemory[];
-
+                timestamp: {
+                    $gte: timeframe.from,
+                    $lte: timeframe.to
+                }
+            }).sort({ timestamp: -1 });
         } catch (error) {
-            console.error('Error getting relevant memories:', error);
+            console.error('Error getting memories in timeframe:', error);
             return [];
         }
     }
 
-    async updateLastAccessed(memoryId: string) {
-        await AIMemoryModel.findByIdAndUpdate(memoryId, {
-            lastAccessed: new Date()
-        });
+    async createFromConversation(conversation: any): Promise<AIMemory | null> {
+        try {
+            // Extract relevant information from conversation
+            const userId = conversation.userId;
+            const agentId = conversation.agentId;
+            
+            // Get the last user message
+            const messages = conversation.messages || [];
+            const lastUserMessage = messages
+                .filter((m: { role: string; content: string }) => m.role === 'user')
+                .reverse()[0]?.content;
+                
+            if (!lastUserMessage) {
+                console.warn('No user messages found in conversation');
+                return null;
+            }
+            
+            // Create memory from the last user message
+            return this.createMemoryFromMessage(
+                userId, 
+                agentId, 
+                lastUserMessage,
+                conversation._id?.toString()
+            );
+        } catch (error) {
+            console.error('Error creating memory from conversation:', error);
+            return null;
+        }
     }
 
-    async cleanupOldMemories(userId: string, agentId: string, maxAge = 30) {
-        const cutoff = new Date();
-        cutoff.setDate(cutoff.getDate() - maxAge);
+    // Additional helper methods for compatibility with existing code can be added here
+}
 
-        await AIMemoryModel.deleteMany({
-            userId,
-            agentId,
-            lastAccessed: { $lt: cutoff },
-            significance: { $lt: 0.7 } // Keep highly significant memories
-        });
-    }
-
-    async createFromConversation(conversation: any) {
-        // Implement conversation to memory logic
-        console.log('Creating memory from conversation:', conversation);
-        // TODO: Implement actual memory creation
-        return null;
-    }
-} 
+export default new AIMemoryService();

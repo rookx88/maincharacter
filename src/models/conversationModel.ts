@@ -1,7 +1,5 @@
-import mongoose, { Schema, Document } from 'mongoose';
-import { ChatMessage, ConversationState, NodeType, AgentType, ConversationNodeType } from '../types/conversation.js';
-import { MemoryService } from '../services/memoryService.js';
-import { AIMemory } from '../types/aiMemory.js';
+import mongoose, { Schema, Document, Model } from 'mongoose';
+import { ChatMessage, ConversationState } from '../types/conversation.js';
 
 // Schema for individual messages
 const messageSchema = new mongoose.Schema<ChatMessage>({
@@ -34,7 +32,7 @@ export interface IConversation extends Document {
     agentSlug: string;
     active: boolean;
     messages: Array<{
-        role: 'user' | 'assistant';
+        role: 'user' | 'assistant' | 'system';
         content: string;
         timestamp: Date;
     }>;
@@ -99,14 +97,21 @@ const ConversationSchema = new Schema<IConversation>({
 ConversationSchema.index({ userId: 1, agentId: 1, active: 1 });
 ConversationSchema.index({ agentSlug: 1 });
 
-interface IConversationModel extends mongoose.Model<IConversation> {}
-
+// Post-save hook to create memory from conversation when inactive
 ConversationSchema.post<IConversation & { _id: unknown } & { __v: number }>('save', async function(doc) {
     if (!doc.active) {
-        const memoryService = new MemoryService();
-        await memoryService.createFromConversation(doc);
+        try {
+            // Import the service directly to avoid circular dependencies
+            const { default: memoryService } = await import('../services/memoryService.js');
+            await memoryService.createFromConversation(doc);
+        } catch (error) {
+            console.error('Error creating memory from conversation:', error);
+        }
     }
 });
 
+// Define the model interface
+interface IConversationModel extends Model<IConversation> {}
+
 const Conversation = mongoose.model<IConversation, IConversationModel>('Conversation', ConversationSchema);
-export default Conversation; 
+export default Conversation;

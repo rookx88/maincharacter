@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
-import { agentService } from '../services/agentService.js';
+import agentService from '../services/agentService.js';
 import { handleError } from '../utils/errorHandler.js';
 import AgentModel from '../models/agentModel.js';
 import { Document } from 'mongoose';
@@ -40,4 +40,4 @@ export const resolveAgent = async (req: Request, res: Response, next: NextFuncti
         console.error('Agent resolution error:', error);
         res.status(500).json({ error: 'Failed to resolve agent' });
     }
-}; 
+};

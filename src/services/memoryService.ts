@@ -6,6 +6,7 @@ import MemoryFragmentModel, { MemoryFragmentDocument } from '../models/memoryFra
 import AIMemoryModel from '../models/aiMemoryModel.js';
 import { AIMemory } from '../types/aiMemory.js';
 import { logger } from "../utils/logger.js";
+import { IMemoryService } from '../types/services.js';
 
 // Simplified interface for memory details
 interface MemoryDetails {
@@ -28,7 +29,7 @@ interface MemoryDetails {
   tags?: string[];
 }
 
-export class MemoryService {
+export class MemoryService implements IMemoryService {
   private openai: OpenAI;
 
   constructor() {
@@ -367,7 +368,7 @@ export class MemoryService {
   /**
    * Extract themes from text
    */
-  private async extractThemes(text: string): Promise<string[]> {
+  async extractThemes(text: string): Promise<string[]> {
     const prompt = `Extract 3-5 key themes or topics from this text. Return ONLY a JSON array of theme words or short phrases:
       "${text}"
       
@@ -410,6 +411,56 @@ export class MemoryService {
     if (!details.people || details.people.length === 0) missingFields.push("people");
     
     return missingFields;
+  }
+
+  /**
+   * Create memory from conversation
+   */
+  async createFromConversation(conversation: any): Promise<any> {
+    try {
+      // Extract relevant information from conversation
+      const userId = conversation.userId;
+      const agentId = conversation.agentId;
+      
+      // Get the last user message
+      const messages = conversation.messages || [];
+      const lastUserMessage = messages
+        .filter((m: { role: string; content: string }) => m.role === 'user')
+        .reverse()[0]?.content;
+        
+      if (!lastUserMessage) {
+        logger.warn('[MEMORY] No user messages found in conversation');
+        return null;
+      }
+      
+      // Check if message is significant
+      const significance = await this.analyzeMemorySignificance(lastUserMessage);
+      
+      if (significance < 0.6) {
+        logger.info('[MEMORY] Message not significant enough for memory creation', { significance });
+        return null;
+      }
+      
+      // Create memory from the last user message
+      const memory = await this.createMemoryFromMessage(
+        userId, 
+        agentId, 
+        lastUserMessage,
+        conversation._id instanceof mongoose.Types.ObjectId ? 
+          conversation._id.toString() : 
+          String(conversation._id)
+      );
+      
+      logger.info('[MEMORY] Created memory from conversation', { 
+        memoryId: memory._id.toString(),
+        significance 
+      });
+      
+      return memory;
+    } catch (error) {
+      logger.error('[MEMORY] Error creating memory from conversation:', error);
+      return null;
+    }
   }
 }
 

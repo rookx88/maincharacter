@@ -2,7 +2,6 @@ import express from 'express';
 import { MemoryController } from '../controllers/memoryController.js';
 import { authenticateToken } from '../middleware/auth.js';
 import Conversation from '../models/conversationModel.js';
-import { MemoryService } from '../services/memoryService.js';
 
 const router = express.Router();
 const memoryController = new MemoryController();
@@ -24,8 +23,10 @@ router.post('/from-conversation/:id',
       if (!conversation) {
           return res.status(404).json({ error: 'Conversation not found' });
       }
-      const memoryService = new MemoryService();
-      const memory = await memoryService.createFromConversation(conversation);
+      
+      // Import the service directly
+      const MemoryService = (await import('../services/memoryService.js')).default;
+      const memory = await MemoryService.createFromConversation(conversation);
       res.status(201).json(memory);
     } catch (error) {
       res.status(500).json({ error: 'Memory creation failed' });
@@ -33,4 +34,4 @@ router.post('/from-conversation/:id',
   }
 );
 
-export default router; 
+export default router;

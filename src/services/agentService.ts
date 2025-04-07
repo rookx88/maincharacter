@@ -157,6 +157,32 @@ export class AgentService {
       frequency_penalty: 0.3
     } as AIAgent;
   }
+  // Add to AgentService class
+// Add to AgentService class in src/services/agentService.ts
+async getAgentIdentity(slug: string): Promise<any> {
+  logger.info('[AGENT] Getting agent identity by slug', { slug });
+  
+  try {
+    const agent = await this.getAgentBySlug(slug);
+    
+    if (!agent) {
+      logger.warn('[AGENT] Agent identity not found', { slug });
+      return null;
+    }
+    
+    // Return a simpler version with just the needed fields
+    return {
+      id: agent._id,
+      name: agent.name,
+      slug: agent.slug,
+      category: agent.category,
+      description: agent.description
+    };
+  } catch (error) {
+    logger.error('[AGENT] Failed to get agent identity', error);
+    return null;
+  }
+}
 }
 
 export default new AgentService();

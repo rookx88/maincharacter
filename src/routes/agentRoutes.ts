@@ -2,7 +2,7 @@ import express from 'express';
 import { services } from '../services/index.js';
 import isAuthenticated from '../middleware/authMiddleware.js';
 import AgentModel from '../models/agentModel.js';
-import { agentService } from '../services/agentService.js';
+import agentService from '../services/agentService.js';
 
 const router = express.Router();
 
@@ -40,4 +40,4 @@ router.get("/by-slug/:slug", async (req, res) => {
     }
 });
 
-export default router; 
+export default router;
