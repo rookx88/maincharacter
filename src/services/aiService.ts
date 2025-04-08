@@ -3,13 +3,21 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
 import { AIAgent } from '../types/agent.js';
 import { ChatMessage } from '../types/conversation.js';
 import { logger } from '../utils/logger.js';
+import dotenv from 'dotenv';
+dotenv.config();
 
 export class AIService {
   private openai: OpenAI;
 
   constructor() {
+    const apiKey = process.env.OPENAI_API_KEY;
+    
+    if (!apiKey) {
+      console.error('WARNING: OPENAI_API_KEY is not set in environment variables');
+    }
+    
     this.openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY
+      apiKey: apiKey || 'dummy-key-for-development'
     });
   }
 

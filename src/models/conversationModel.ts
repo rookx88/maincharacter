@@ -1,5 +1,5 @@
 import mongoose, { Schema, Document, Model } from 'mongoose';
-import { ChatMessage, ConversationState } from '../types/conversation.js';
+import { ChatMessage, ConversationState, IntroductionStage } from '../types/conversation.js';
 
 // Schema for individual messages
 const messageSchema = new mongoose.Schema<ChatMessage>({
@@ -12,7 +12,13 @@ const messageSchema = new mongoose.Schema<ChatMessage>({
     timestamp: { type: Date, default: Date.now }
 });
 
-// New schema for narrative state
+// Memory details schema
+const memoryDetailsSchema = new mongoose.Schema({
+    fragmentId: { type: String },
+    content: { type: String }
+});
+
+// Updated schema for narrative state with explicit fields for introduction flow
 const narrativeStateSchema = new mongoose.Schema({
     hasCompletedIntroduction: { type: Boolean, default: false },
     relationshipStage: { 
@@ -20,6 +26,14 @@ const narrativeStateSchema = new mongoose.Schema({
         enum: ['stranger', 'acquaintance', 'friend'],
         default: 'stranger'
     },
+    // Add these explicit fields for the introduction flow
+    introStage: { 
+        type: String, 
+        enum: Object.values(IntroductionStage),
+        default: IntroductionStage.INITIAL_GREETING
+    },
+    stageRepeatCount: { type: Number, default: 0 },
+    memoryDetails: { type: memoryDetailsSchema, default: () => ({}) },
     knownTopics: [String],
     sharedStories: [String],
     lastInteractionTimestamp: { type: Date, default: Date.now },
@@ -41,6 +55,13 @@ export interface IConversation extends Document {
     narrativeState: {
         hasCompletedIntroduction: boolean;
         relationshipStage: 'stranger' | 'acquaintance' | 'friend';
+        // Add these to the interface as well
+        introStage?: IntroductionStage;
+        stageRepeatCount?: number;
+        memoryDetails?: {
+            fragmentId?: string;
+            content?: string;
+        };
         knownTopics: string[];
         sharedStories: string[];
         lastInteractionTimestamp: Date;
@@ -77,12 +98,14 @@ const ConversationSchema = new Schema<IConversation>({
             interest: { type: Number, default: 0 }
         }
     },
-    // Add the narrative state to the schema
+    // Updated narrative state with the explicit schema
     narrativeState: {
         type: narrativeStateSchema,
         default: () => ({
             hasCompletedIntroduction: false,
             relationshipStage: 'stranger',
+            introStage: IntroductionStage.INITIAL_GREETING,
+            stageRepeatCount: 0,
             knownTopics: [],
             sharedStories: [],
             lastInteractionTimestamp: new Date(),

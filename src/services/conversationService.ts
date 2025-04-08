@@ -46,7 +46,7 @@ export class ConversationService {
     logger.info('[CONVERSATION] Getting or creating conversation', { userId, agentSlug });
     
     try {
-      // Look for existing conversation
+      // Look for existing ACTIVE conversation
       const existing = await Conversation.findOne({
         userId,
         agentSlug,
@@ -54,62 +54,96 @@ export class ConversationService {
       });
       
       if (existing) {
-        logger.info('[CONVERSATION] Found existing conversation', { 
-          id: existing._id instanceof mongoose.Types.ObjectId ? 
+        // If we have an existing conversation with completed intro and in casual conversation node,
+        // mark it inactive and create a new one
+        if (
+          existing.narrativeState?.hasCompletedIntroduction && 
+          existing.currentNode === ConversationNodeType.CASUAL_CONVERSATION
+        ) {
+          logger.info('[CONVERSATION] Found completed conversation, creating new one', { 
+            existingId: existing._id instanceof mongoose.Types.ObjectId ? 
               existing._id.toString() : 
               String(existing._id)
+          });
+          
+          // Mark it inactive
+          existing.active = false;
+          await existing.save();
+          
+          // Create a new conversation
+          return this.createNewConversation(userId, agentSlug);
+        }
+        
+        logger.info('[CONVERSATION] Found existing conversation', { 
+          id: existing._id instanceof mongoose.Types.ObjectId ? 
+            existing._id.toString() : 
+            String(existing._id)
         });
         return { conversation: existing, isNew: false };
       }
       
-      // Get the agent
-      const agent = await this.agentService.getAgentBySlug(agentSlug);
-      if (!agent) {
-        logger.error('[CONVERSATION] Agent not found', { agentSlug });
-        throw new Error('Agent not found');
-      }
-      
-      // Create initial state
-      const narrativeState: NarrativeState = {
-        hasCompletedIntroduction: false,
-        relationshipStage: 'stranger',
-        knownTopics: [],
-        sharedStories: [],
-        lastInteractionTimestamp: new Date(),
-        agentSpecificState: {},
-        introStage: IntroductionStage.INITIAL_GREETING
-      };
-      
-      // Create a greeting message
-      const initialMessage = this.getInitialMessage(agent);
-      
-      // Create new conversation
-      const conversation = await Conversation.create({
-        userId,
-        agentId: agent._id.toString(),
-        agentSlug,
-        currentNode: ConversationNodeType.ENTRY,
-        narrativeState,
-        messages: [{
-          role: 'assistant',
-          content: initialMessage,
-          timestamp: new Date()
-        }],
-        active: true
-      });
-      
-      logger.info('[CONVERSATION] Created new conversation', { 
-        id: conversation._id instanceof mongoose.Types.ObjectId ? 
-            conversation._id.toString() : 
-            String(conversation._id),
-        initialMessage: initialMessage.substring(0, 50) + '...'
-      });
-      
-      return { conversation, isNew: true };
+      // Create a new conversation if none exists
+      return this.createNewConversation(userId, agentSlug);
     } catch (error) {
       logger.error('[CONVERSATION] Failed to get or create conversation', error);
       throw error;
     }
+  }
+
+  /**
+   * Helper method to create a new conversation
+   */
+  private async createNewConversation(
+    userId: string, 
+    agentSlug: string
+  ): Promise<{ 
+    conversation: IConversationDocument; 
+    isNew: boolean; 
+  }> {
+    // Get the agent
+    const agent = await this.agentService.getAgentBySlug(agentSlug);
+    if (!agent) {
+      logger.error('[CONVERSATION] Agent not found', { agentSlug });
+      throw new Error('Agent not found');
+    }
+    
+    // Create initial state
+    const narrativeState = {
+      hasCompletedIntroduction: false,
+      relationshipStage: 'stranger',
+      knownTopics: [],
+      sharedStories: [],
+      lastInteractionTimestamp: new Date(),
+      agentSpecificState: {},
+      introStage: IntroductionStage.INITIAL_GREETING
+    };
+    
+    // Create a greeting message
+    const initialMessage = this.getInitialMessage(agent);
+    
+    // Create new conversation
+    const conversation = await Conversation.create({
+      userId,
+      agentId: agent._id.toString(),
+      agentSlug,
+      currentNode: ConversationNodeType.ENTRY,
+      narrativeState,
+      messages: [{
+        role: 'assistant',
+        content: initialMessage,
+        timestamp: new Date()
+      }],
+      active: true
+    });
+    
+    logger.info('[CONVERSATION] Created new conversation', { 
+      id: conversation._id instanceof mongoose.Types.ObjectId ? 
+        conversation._id.toString() : 
+        String(conversation._id),
+      initialMessage: initialMessage.substring(0, 50) + '...'
+    });
+    
+    return { conversation, isNew: true };
   }
 
   /**
@@ -136,7 +170,7 @@ export class ConversationService {
     
     try {
       // Get conversation
-      const { conversation } = await this.getOrCreateConversation(userId, agentSlug);
+      let { conversation, isNew } = await this.getOrCreateConversation(userId, agentSlug);
       
       // Get agent
       const agent = await this.agentService.getAgentBySlug(agentSlug);
@@ -154,8 +188,8 @@ export class ConversationService {
       // Save message and response
       await this.saveMessageAndResponse(
         conversation._id instanceof mongoose.Types.ObjectId ? 
-            conversation._id.toString() : 
-            String(conversation._id),
+          conversation._id.toString() : 
+          String(conversation._id),
         message,
         result.response,
         result.nextNode,
@@ -164,7 +198,9 @@ export class ConversationService {
       
       logger.info('[CONVERSATION] Processed message', {
         responsePreview: result.response.substring(0, 50) + (result.response.length > 50 ? '...' : ''),
-        nextNode: result.nextNode
+        nextNode: result.nextNode,
+        hasCompletedIntro: conversation.narrativeState?.hasCompletedIntroduction,
+        conversationEnded: result.metadata?.conversationEnded
       });
       
       return result;
@@ -193,6 +229,14 @@ export class ConversationService {
     // Get current state - use type assertion to access properties
     const narrativeState = conversation.narrativeState as unknown as NarrativeState;
     const currentNode = conversation.currentNode as ConversationNodeType; 
+    
+    // Add this debug log to see what stages are being used
+    console.log("Current narrative state:", { 
+      hasCompletedIntro: narrativeState.hasCompletedIntroduction, 
+      currentStage: narrativeState.introStage, 
+      relationship: narrativeState.relationshipStage,
+      currentNode
+    });
     
     // Handle based on introduction completion
     if (!narrativeState.hasCompletedIntroduction) {
@@ -237,6 +281,45 @@ export class ConversationService {
       agent: agent.slug
     });
     
+    // Special handling for the final stage - CHECK FIRST if user has responded positively to the ESTABLISH_RELATIONSHIP stage
+    if (currentStage === IntroductionStage.ESTABLISH_RELATIONSHIP && 
+        this.isPositiveResponseFinal(message)) {
+      
+      logger.info('[CONVERSATION] Detected positive response at final stage - completing introduction');
+      
+      // Mark introduction as complete
+      narrativeState.hasCompletedIntroduction = true;
+      narrativeState.relationshipStage = 'acquaintance';
+      
+      // Save the updated state
+      await Conversation.findByIdAndUpdate(
+        conversation._id,
+        { 
+          $set: { 
+            "narrativeState.hasCompletedIntroduction": true,
+            "narrativeState.relationshipStage": "acquaintance"
+          } 
+        }
+      );
+      
+      // Log completion
+      const completeCheck = await Conversation.findById(conversation._id);
+      console.log("After completing introduction, stored value:", 
+        JSON.stringify(completeCheck?.narrativeState, null, 2));
+      
+      // Get the farewell message
+      const farewell = this.getFarewellMessage(agent);
+      
+      // Return final response with conversationEnded flag
+      return {
+        response: farewell,
+        nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+        metadata: {
+          conversationEnded: true
+        }
+      };
+    }
+    
     // Check if we should advance to next stage
     if (this.shouldAdvanceStage(message, currentStage, agent.slug)) {
       // Get next stage
@@ -246,6 +329,9 @@ export class ConversationService {
         currentStage,
         nextStage
       });
+      
+      // Log the state before update
+      console.log(`Before state update: ${narrativeState.introStage}`);
       
       // Memory creation at appropriate stages
       let memoryFragmentId: string | undefined = undefined;
@@ -296,37 +382,25 @@ export class ConversationService {
       narrativeState.introStage = nextStage;
       narrativeState.stageRepeatCount = 0;
       
-      // Final stage handling
-      if (nextStage === IntroductionStage.ESTABLISH_RELATIONSHIP && 
-          this.isPositiveResponse(message)) {
-        // Mark introduction as complete
-        narrativeState.hasCompletedIntroduction = true;
-        
-        // Save updated state - use $set operator to update the field directly
-        await Conversation.findByIdAndUpdate(
-          conversation._id,
-          { $set: { narrativeState } }
-        );
-        
-        // Get the farewell response
-        const farewell = this.getFarewellMessage(agent);
-        
-        // Return final response
-        return {
-          response: farewell,
-          nextNode: ConversationNodeType.CASUAL_CONVERSATION,
-          metadata: {
-            conversationEnded: true,
-            memoryFragmentId
-          }
-        };
-      }
-      
       // Save updated state - use $set operator to update the field directly
-      await Conversation.findByIdAndUpdate(
+      // Convert enum to string to ensure proper storage
+      const result = await Conversation.findByIdAndUpdate(
         conversation._id,
-        { $set: { narrativeState } }
+        { 
+          $set: { 
+            "narrativeState.introStage": nextStage.toString(), 
+            "narrativeState.stageRepeatCount": 0 
+          } 
+        },
+        { new: true }
       );
+      
+      // Add direct check of what was saved
+      const checkDoc = await Conversation.findById(conversation._id);
+      console.log("After DB update, stored value:", JSON.stringify(checkDoc?.narrativeState, null, 2));
+      
+      // Log the state after update
+      console.log(`After state update: ${nextStage}`);
       
       // Return response for next stage
       return {
@@ -341,10 +415,22 @@ export class ConversationService {
       narrativeState.stageRepeatCount = (narrativeState.stageRepeatCount || 0) + 1;
       
       // Save updated state - use $set operator to update the field directly
-      await Conversation.findByIdAndUpdate(
+      // Ensure we store the stage as well to prevent issues
+      const updateResult = await Conversation.findByIdAndUpdate(
         conversation._id,
-        { $set: { narrativeState } }
+        { 
+          $set: { 
+            "narrativeState.stageRepeatCount": narrativeState.stageRepeatCount,
+            // Make sure the introStage is properly set in case it got lost
+            "narrativeState.introStage": currentStage.toString()
+          } 
+        },
+        { new: true }
       );
+      
+      // Check what was actually stored
+      const checkDoc = await Conversation.findById(conversation._id);
+      console.log("After repeat count update, stored value:", JSON.stringify(checkDoc?.narrativeState, null, 2));
       
       // Get follow-up prompt
       const followUp = this.generateFollowUp(message, currentStage, agent.slug);
@@ -542,7 +628,7 @@ export class ConversationService {
     }
     
     // Fallback farewell
-    return `I need to run now. Hope to catch up with you again soon!`;
+    return `I really appreciate your help today! I need to run now and get ready for the show. Hope to catch up with you again soon!`;
   }
 
   /**
@@ -735,6 +821,32 @@ export class ConversationService {
     ];
     
     return positivePatterns.some(pattern => pattern.test(lowerMessage));
+  }
+
+  /**
+   * Enhanced positive response detection specifically for the final stage
+   * Includes more patterns like "I'd like that" which wasn't in the original method
+   */
+  private isPositiveResponseFinal(message: string): boolean {
+    const lowerMessage = message.toLowerCase();
+    
+    // Add patterns specifically for the final stage response
+    const finalPositivePatterns = [
+      /\b(yes|yeah|yep|sure|ok|okay|of course|certainly|absolutely|definitely)\b/i,
+      /\b(happy to|glad to|i'd love to|i would|i will|i can|i'd be|love to)\b/i,
+      /\b(i'd like that|sounds good|looking forward|great|awesome|fantastic)\b/i,
+      /\b(count me in|lets do it|let's do it|id be happy|i'd be happy)\b/i
+    ];
+    
+    logger.info('[CONVERSATION] Checking final stage response patterns', { message: lowerMessage });
+    
+    return finalPositivePatterns.some(pattern => {
+      const matches = pattern.test(lowerMessage);
+      if (matches) {
+        logger.info('[CONVERSATION] Matched positive pattern', { pattern: pattern.toString() });
+      }
+      return matches;
+    });
   }
 
   /**

@@ -336,21 +336,17 @@
     left: 0;
     width: 100%;
     height: 100%;
-    background-color: rgba(0, 0, 0, 0.7);
+    background-color: rgba(15, 23, 42, 0.85);
     display: flex;
     justify-content: center;
     align-items: center;
     z-index: 1000;
+    backdrop-filter: blur(8px);
 }
 
 .end-modal-content {
-    background-color: white;
-    padding: 2rem;
-    border-radius: 8px;
-    max-width: 500px;
-    text-align: center;
-    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-}
+    background: linear-gradient(to bottom, #1e293b, #0f172a);
+    padding: 2 }
 
 .end-modal-content h2 {
     margin-top: 0;

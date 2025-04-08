@@ -47,14 +47,32 @@ app.get('/api/test', (req, res) => {
     res.json({ message: 'API is working' });
 });
 
-// Serve static files and React app AFTER API routes
+// Serve static files with proper MIME types
 const clientPath = path.join(__dirname, '../dist/client');
-app.use(express.static(clientPath));
-app.get('*', (req, res) => {
-    // Serve index.html for all routes except /api
-    if (!req.path.startsWith('/api')) {
-        res.sendFile(path.join(__dirname, 'client/index.html'));
+app.use(express.static(clientPath, {
+    setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.js')) {
+            res.setHeader('Content-Type', 'application/javascript');
+        } else if (filePath.endsWith('.css')) {
+            res.setHeader('Content-Type', 'text/css');
+        } else if (filePath.endsWith('.svg')) {
+            res.setHeader('Content-Type', 'image/svg+xml');
+        } else if (filePath.endsWith('.json')) {
+            res.setHeader('Content-Type', 'application/json');
+        }
     }
+}));
+
+// Catch-all route for SPA (React Router)
+app.get('*', (req, res, next) => {
+    // Skip API routes and static files with extensions
+    if (req.path.startsWith('/api') || req.path.includes('.')) {
+        next();
+        return;
+    }
+    
+    // For all other routes, serve the index.html to support client-side routing
+    res.sendFile(path.join(clientPath, 'index.html'));
 });
 
 // Add after routes are mounted
@@ -88,4 +106,4 @@ server.on('error', (e: any) => {
     }
 });
 
-export default app; 
+export default app;
