@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../api/config';
 import './NewConversationUI.css';
+import TestControls from './TestControls'; // Import the TestControls component
 
 interface Message {
     role: 'user' | 'assistant';
@@ -117,9 +118,16 @@ export default function NewConversationUI() {
             if (startRes.data?.messages && startRes.data.messages.length > 0) {
                 console.log('Initial messages from start:', startRes.data.messages);
                 setMessages(startRes.data.messages);
+                
+                // Check for suggested responses in the initial message
+                if (startRes.data?.suggestedResponses) {
+                    console.log('Initial suggested responses:', startRes.data.suggestedResponses);
+                    setSuggestedResponses(startRes.data.suggestedResponses);
+                }
             } else {
                 console.warn('No initial messages in start response');
                 setMessages([]);
+                setSuggestedResponses([]);
             }
         } catch (error) {
             console.error('Error starting new conversation:', error);
@@ -199,10 +207,10 @@ export default function NewConversationUI() {
             
             // Check if we have a response
             if (response.data) {
-                const aiResponseText = typeof response.data.response === 'string' 
-                    ? response.data.response 
-                    : (typeof response.data.message === 'string' 
-                        ? response.data.message 
+                const aiResponseText = typeof response.data.message === 'string' 
+                    ? response.data.message 
+                    : (typeof response.data.response === 'string' 
+                        ? response.data.response 
                         : "I'm not sure how to respond to that.");
                 
                 console.log('AI response text:', aiResponseText);
@@ -219,20 +227,29 @@ export default function NewConversationUI() {
                 // Update messages with the new AI message
                 setMessages(prev => [...prev, aiMessage]);
                 
-                // Extract metadata
-                const metadata = response.data.metadata || {};
+                // Enhanced suggested responses handling
+                console.log('Looking for suggested responses in:', response.data);
                 
-                // Handle suggested responses
-                if (metadata && Array.isArray(metadata.suggestedResponses) && metadata.suggestedResponses.length > 0) {
-                    console.log('Setting suggested responses:', metadata.suggestedResponses);
-                    setSuggestedResponses(metadata.suggestedResponses);
+                // Try multiple places where suggested responses might be located
+                const suggestedResponses = 
+                    Array.isArray(response.data.suggestedResponses) ? response.data.suggestedResponses :
+                    (response.data.metadata && Array.isArray(response.data.metadata.suggestedResponses)) ? 
+                    response.data.metadata.suggestedResponses : [];
+                
+                console.log('Found suggested responses:', suggestedResponses);
+                
+                if (suggestedResponses.length > 0) {
+                    setSuggestedResponses(suggestedResponses);
                 } else {
-                    console.log('No suggested responses found');
                     setSuggestedResponses([]);
                 }
                 
                 // Check for conversation end
-                if (metadata?.conversationEnded) {
+                const conversationEnded = 
+                    response.data.conversationEnded || 
+                    (response.data.metadata && response.data.metadata.conversationEnded);
+                
+                if (conversationEnded) {
                     setShowEndModal(true);
                 }
             } else {
@@ -360,15 +377,17 @@ export default function NewConversationUI() {
             {Array.isArray(suggestedResponses) && suggestedResponses.length > 0 && (
                 <div className="suggested-responses">
                     <p className="suggested-responses-title">Suggested responses:</p>
-                    {suggestedResponses.map((response, index) => (
-                        <button 
-                            key={index}
-                            className="suggested-response-btn"
-                            onClick={() => handleSuggestedResponseClick(response)}
-                        >
-                            {response}
-                        </button>
-                    ))}
+                    <div className="suggested-responses-container">
+                        {suggestedResponses.map((response, index) => (
+                            <button 
+                                key={index}
+                                className="suggested-response"
+                                onClick={() => handleSuggestedResponseClick(response)}
+                            >
+                                {response}
+                            </button>
+                        ))}
+                    </div>
                 </div>
             )}
 
@@ -403,6 +422,14 @@ export default function NewConversationUI() {
                         </div>
                     </div>
                 </div>
+            )}
+            
+            {/* Add the TestControls component */}
+            {process.env.NODE_ENV !== 'production' && (
+                <TestControls 
+                    agentSlug={agentSlug || ''} 
+                    onReset={startNewConversation}
+                />
             )}
         </div>
     );

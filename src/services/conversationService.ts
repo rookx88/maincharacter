@@ -54,30 +54,13 @@ export class ConversationService {
       });
       
       if (existing) {
-        // If we have an existing conversation with completed intro and in casual conversation node,
-        // mark it inactive and create a new one
-        if (
-          existing.narrativeState?.hasCompletedIntroduction && 
-          existing.currentNode === ConversationNodeType.CASUAL_CONVERSATION
-        ) {
-          logger.info('[CONVERSATION] Found completed conversation, creating new one', { 
-            existingId: existing._id instanceof mongoose.Types.ObjectId ? 
-              existing._id.toString() : 
-              String(existing._id)
-          });
-          
-          // Mark it inactive
-          existing.active = false;
-          await existing.save();
-          
-          // Create a new conversation
-          return this.createNewConversation(userId, agentSlug);
-        }
-        
+        // MODIFIED: Keep using the existing conversation regardless of introState
+        // This prevents resetting to introduction when returning
         logger.info('[CONVERSATION] Found existing conversation', { 
           id: existing._id instanceof mongoose.Types.ObjectId ? 
             existing._id.toString() : 
-            String(existing._id)
+            String(existing._id),
+          hasCompletedIntro: existing.narrativeState?.hasCompletedIntroduction
         });
         return { conversation: existing, isNew: false };
       }
@@ -150,7 +133,7 @@ export class ConversationService {
    * Process user message
    */
   async processMessage(
-    userId: string, 
+  userId: string, 
     agentSlug: string, 
     message: string
   ): Promise<{
@@ -390,11 +373,11 @@ export class ConversationService {
           $set: { 
             "narrativeState.introStage": nextStage.toString(), 
             "narrativeState.stageRepeatCount": 0 
-          } 
-        },
-        { new: true }
-      );
-      
+                    }
+                },
+                { new: true }
+            );
+            
       // Add direct check of what was saved
       const checkDoc = await Conversation.findById(conversation._id);
       console.log("After DB update, stored value:", JSON.stringify(checkDoc?.narrativeState, null, 2));
@@ -418,15 +401,15 @@ export class ConversationService {
       // Ensure we store the stage as well to prevent issues
       const updateResult = await Conversation.findByIdAndUpdate(
         conversation._id,
-        { 
-          $set: { 
+                { 
+                    $set: { 
             "narrativeState.stageRepeatCount": narrativeState.stageRepeatCount,
             // Make sure the introStage is properly set in case it got lost
             "narrativeState.introStage": currentStage.toString()
-          } 
-        },
-        { new: true }
-      );
+                    }
+                },
+                { new: true }
+            );
       
       // Check what was actually stored
       const checkDoc = await Conversation.findById(conversation._id);
@@ -434,8 +417,8 @@ export class ConversationService {
       
       // Get follow-up prompt
       const followUp = this.generateFollowUp(message, currentStage, agent.slug);
-      
-      return {
+            
+            return {
         response: followUp || this.getIntroStageResponse(agent, currentStage),
         nextNode: ConversationNodeType.ENTRY,
         metadata: {
