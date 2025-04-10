@@ -428,96 +428,117 @@ export class ConversationService {
     }
   }
 
-  /**
-   * Handle regular conversation
-   */
-  private async handleRegularConversation(
-    message: string,
-    conversation: IConversationDocument,
-    agent: AIAgent
-  ): Promise<{
-    response: string;
-    nextNode: ConversationNodeType;
-    metadata?: {
-      suggestedResponses?: string[];
-      memoryFragmentId?: string;
-    };
-  }> {
-    logger.info('[CONVERSATION] Processing regular conversation');
+// Add this to src/services/conversationService.ts
+// Inside the handleRegularConversation method, modify the return object
+
+private async handleRegularConversation(
+  message: string,
+  conversation: IConversationDocument,
+  agent: AIAgent
+): Promise<{
+  response: string;
+  nextNode: ConversationNodeType;
+  metadata?: {
+    suggestedResponses?: string[];
+    memoryFragmentId?: string;
+    conversationEnded?: boolean;  // Add this explicitly
+  };
+}> {
+  logger.info('[CONVERSATION] Processing regular conversation');
+  
+  try {
+    // Get relevant memories for context
+    const relevantMemories = await this.getRelevantMemories(
+      conversation.userId,
+      conversation.agentId,
+      message
+    );
     
-    try {
-      // Get relevant memories for context
-      const relevantMemories = await this.getRelevantMemories(
-        conversation.userId,
-        conversation.agentId,
-        message
-      );
-      
-      // Create a prompt with memory context
-      const memoryContext = relevantMemories.length > 0 
-        ? `\n\nYou may reference these relevant memories if appropriate:\n${relevantMemories.map(m => `- ${m.content}`).join('\n')}`
-        : '';
-      
-      const prompt = `Respond naturally to the user's message. You're having a casual conversation.${memoryContext}`;
-      
-      // Generate response using AI
-      const aiResponse = await this.aiService.generateResponse(prompt, {
-        userMessage: message,
-        agent,
-        conversationHistory: conversation.messages
-      });
-      
-      // Check for significance and create memory if needed
-      const significance = await this.aiService.analyzeSignificance(message);
-      
-      let memoryFragmentId: string | undefined = undefined;
-      
-      if (significance > 0.7 && this.assessStoryQuality(message)) {
-        try {
-          const memoryFragment = await this.memoryService.createMemoryFromMessage(
-            conversation.userId,
-            conversation.agentId,
-            message,
-            conversation._id instanceof mongoose.Types.ObjectId ? 
-                conversation._id.toString() : 
-                String(conversation._id)
-          );
-          
-          memoryFragmentId = memoryFragment._id.toString();
-          logger.info('[CONVERSATION] Created memory fragment from significant message', { 
-            memoryFragmentId,
-            significance 
-          });
-        } catch (error) {
-          logger.error('[CONVERSATION] Failed to create memory fragment', error);
-        }
+    // Create a prompt with memory context
+    const memoryContext = relevantMemories.length > 0 
+      ? `\n\nYou may reference these relevant memories if appropriate:\n${relevantMemories.map(m => `- ${m.content}`).join('\n')}`
+      : '';
+    
+    const prompt = `Respond naturally to the user's message. You're having a casual conversation.${memoryContext}`;
+    
+    // Generate response using AI
+    const aiResponse = await this.aiService.generateResponse(prompt, {
+      userMessage: message,
+      agent,
+      conversationHistory: conversation.messages
+    });
+    
+    // Check for significance and create memory if needed
+    const significance = await this.aiService.analyzeSignificance(message);
+    
+    let memoryFragmentId: string | undefined = undefined;
+    
+    if (significance > 0.7 && this.assessStoryQuality(message)) {
+      try {
+        const memoryFragment = await this.memoryService.createMemoryFromMessage(
+          conversation.userId,
+          conversation.agentId,
+          message,
+          conversation._id instanceof mongoose.Types.ObjectId ? 
+              conversation._id.toString() : 
+              String(conversation._id)
+        );
+        
+        memoryFragmentId = memoryFragment._id.toString();
+        logger.info('[CONVERSATION] Created memory fragment from significant message', { 
+          memoryFragmentId,
+          significance 
+        });
+      } catch (error) {
+        logger.error('[CONVERSATION] Failed to create memory fragment', error);
       }
-      
-      // Generate suggested responses
-      const suggestedResponses = await this.aiService.generateSuggestedResponses(
-        aiResponse,
-        {
-          agent,
-          conversationStage: 'casual_conversation'
-        }
-      );
-      
-      return {
-        response: aiResponse,
-        nextNode: ConversationNodeType.CASUAL_CONVERSATION,
-        metadata: {
-          suggestedResponses,
-          memoryFragmentId
-        }
-      };
-    } catch (error) {
-      logger.error('[CONVERSATION] Error in regular conversation handling', error);
-      return {
-        response: "I'm sorry, I'm having trouble processing that. Can we try a different topic?",
-        nextNode: ConversationNodeType.CASUAL_CONVERSATION
-      };
     }
+    
+    // Generate suggested responses
+    const suggestedResponses = await this.aiService.generateSuggestedResponses(
+      aiResponse,
+      {
+        agent,
+        conversationStage: 'casual_conversation'
+      }
+    );
+    
+    // Check if we should skip ending
+    // @ts-ignore - accessing custom field
+    const skipEndingFlow = conversation.narrativeState.skipEndingFlow === true;
+    
+    // Final check for conversation ending phrases in the AI response
+    const hasEndingPhrase = 
+      aiResponse.includes("I need to run now") || 
+      aiResponse.includes("I should go now") ||
+      aiResponse.includes("I have to get ready");
+    
+    // Only mark conversation as ended if it has ending phrase and we're not skipping the ending flow
+    const conversationEnded = hasEndingPhrase && !skipEndingFlow;
+    
+    logger.info('[CONVERSATION] Regular conversation response prepared', {
+      hasEndingPhrase,
+      skipEndingFlow,
+      conversationEnded
+    });
+    
+    return {
+      response: aiResponse,
+      nextNode: ConversationNodeType.CASUAL_CONVERSATION,
+      metadata: {
+        suggestedResponses,
+        memoryFragmentId,
+        conversationEnded
+      }
+    };
+  } catch (error) {
+    logger.error('[CONVERSATION] Error in regular conversation handling', error);
+    return {
+      response: "I'm sorry, I'm having trouble processing that. Can we try a different topic?",
+      nextNode: ConversationNodeType.CASUAL_CONVERSATION
+    };
   }
+}
 
   /**
    * Save message and response to conversation

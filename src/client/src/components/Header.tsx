@@ -24,23 +24,25 @@ const Header: React.FC = () => {
             <div className="header-content">
                 <div className="logo-section">
                     <Link to="/" className="logo">
-                        <img 
-                            src="/images/brand/MC-Header.svg" 
-                            alt="Main Character Logo" 
+                        <img
+                            src="/images/brand/MC-Header.svg"
+                            alt="Main Character Logo"
                             className="logo-image"
                         />
                     </Link>
                     <span className="tagline">The future of storytelling: Engaging. Intelligent. Yours.</span>
                 </div>
+                
                 <nav className="nav-links">
                     <NavLink to="/agents">Story Vault</NavLink>
                     <NavLink to="/memory-viewer">Memories</NavLink>
+                    <NavLink to="/map">City Map</NavLink>
                 </nav>
                 <div className="user-section">
                     <span className="user-name">
                         Welcome, {user?.name}
                     </span>
-                    <button 
+                    <button
                         onClick={handleLogout}
                         className="logout-button"
                     >

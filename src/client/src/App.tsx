@@ -8,6 +8,7 @@ import Header from './components/Header';
 import Footer from './components/Footer';
 import MemoryViewer from './components/MemoryViewer';
 import NewConversationUI from './components/NewConversationUI';
+import MapPage from './components/MapPage';
 import ErrorBoundary from './components/ErrorBoundary';
 import SimpleConversationUI from './components/SimpleConversationUI';
 import { useEffect } from 'react';
@@ -15,17 +16,17 @@ import { useEffect } from 'react';
 const AppRoutes = () => {
     const { user } = useAuth();
     const location = useLocation();
-    
+
     useEffect(() => {
         console.log('Current location:', location.pathname);
     }, [location]);
-    
+
     return (
         <Routes>
             {/* Public routes */}
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
-            
+
             {/* Protected routes */}
             <Route path="/agents" element={
                 <ProtectedRoute>
@@ -42,6 +43,11 @@ const AppRoutes = () => {
                     <NewConversationUI />
                 </ProtectedRoute>
             } />
+            <Route path="/map" element={
+                <ProtectedRoute>
+                    <MapPage />
+                </ProtectedRoute>
+            } />
             <Route path="/memory-viewer" element={
                 <ProtectedRoute>
                     {user ? (
@@ -51,7 +57,7 @@ const AppRoutes = () => {
                     )}
                 </ProtectedRoute>
             } />
-            
+
             {/* Redirect root to agents if logged in, otherwise to login */}
             <Route path="/" element={
                 user ? <Navigate to="/agents" replace /> : <Navigate to="/login" replace />

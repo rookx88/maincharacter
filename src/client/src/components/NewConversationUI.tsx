@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../api/config';
 import './NewConversationUI.css';
-import TestControls from './TestControls'; // Import the TestControls component
+import TestControls from './TestControls';
 
 interface Message {
     role: 'user' | 'assistant';
@@ -349,15 +349,7 @@ export default function NewConversationUI() {
                 </div>
             )}
 
-            <div className="chat-controls">
-                <button 
-                    className="reset-button"
-                    onClick={resetConversation}
-                    disabled={isLoading}
-                >
-                    Reset Conversation
-                </button>
-            </div>
+         
 
             <div className="messages-area">
                 {Array.isArray(messages) && messages.length > 0 ? (
@@ -416,9 +408,7 @@ export default function NewConversationUI() {
                             <button onClick={handleReturnToAgents}>
                                 Return to Agent Selection
                             </button>
-                            <button onClick={resetConversation}>
-                                Start New Conversation
-                            </button>
+                            
                         </div>
                     </div>
                 </div>
@@ -431,6 +421,75 @@ export default function NewConversationUI() {
                     onReset={startNewConversation}
                 />
             )}
+            
+            {/* Always visible test controls */}
+            <div style={{
+              position: 'fixed',
+              bottom: '20px',
+              right: '20px',
+              zIndex: 10000,
+              background: 'black',
+              padding: '15px',
+              borderRadius: '10px',
+              border: '2px solid red',
+              boxShadow: '0 0 10px rgba(255,0,0,0.5)'
+            }}>
+              <div style={{ color: 'white', fontWeight: 'bold', marginBottom: '10px' }}>
+                Test Controls
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button
+                  onClick={async () => {
+                    try {
+                      console.log('Resetting to introduction mode');
+                      await api.post('/conversations/reset', { 
+                        agentSlug,
+                        mode: 'introduction'
+                      });
+                      window.location.reload();
+                    } catch (error) {
+                      console.error('Error resetting conversation:', error);
+                      alert('Failed to reset to introduction mode');
+                    }
+                  }}
+                  style={{
+                    background: 'blue',
+                    color: 'white',
+                    padding: '8px 12px',
+                    border: 'none',
+                    borderRadius: '5px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Intro Mode
+                </button>
+                <button
+                  onClick={async () => {
+                    try {
+                      console.log('Resetting to casual mode');
+                      await api.post('/conversations/reset', { 
+                        agentSlug,
+                        mode: 'casual'
+                      });
+                      window.location.reload();
+                    } catch (error) {
+                      console.error('Error resetting conversation:', error);
+                      alert('Failed to reset to casual mode');
+                    }
+                  }}
+                  style={{
+                    background: 'green',
+                    color: 'white',
+                    padding: '8px 12px',
+                    border: 'none',
+                    borderRadius: '5px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  Casual Mode
+                </button>
+              </div>
+            </div>
         </div>
     );
 }
