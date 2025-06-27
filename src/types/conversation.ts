@@ -82,7 +82,6 @@ export enum ConversationNodeType {
 }
 
 export interface ConversationState {
-    currentNode: ConversationNodeType;
     hasMetBefore: boolean;
     engagementLevel: number;
     revealMade: boolean;

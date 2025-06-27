@@ -81,7 +81,6 @@ const ConversationSchema = new Schema<IConversation>({
     messages: [messageSchema],
     currentNode: { type: String, default: 'entry' },
     conversationState: {
-        currentNode: { type: String, default: 'entry' },
         hasMetBefore: { type: Boolean, default: false },
         engagementLevel: { type: Number, default: 0 },
         revealMade: { type: Boolean, default: false },
